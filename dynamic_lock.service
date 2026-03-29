@@ -1,6 +1,16 @@
+# =============================================================================
+# dynamic_lock.service — systemd USER service (v2.0)
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user/
+#   cp dynamic_lock.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dynamic_lock.service
+# =============================================================================
+
 [Unit]
-Description=Dynamic Lock — Bluetooth proximity screen lock
-After=bluetooth.target graphical-session.target
+Description=Bluetooth Dynamic Lock
+After=bluetooth.target graphical-session.target network.target
 Wants=bluetooth.target graphical-session.target
 
 # Prevent infinite restart storms
@@ -11,14 +21,19 @@ StartLimitBurst=4
 Type=simple
 ExecStart=%h/.local/bin/dynamic_lock.sh
 
-# DBus session address — required for loginctl and notify-send
+# Fast shutdown — script handles SIGTERM via trap, but this is a safety net
+TimeoutStopSec=5
+KillSignal=SIGTERM
+
+# DBus session address — required for loginctl and notify-send to work
+# from a background service
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
 
 # Restart on failure, not on clean exit
 Restart=on-failure
-RestartSec=10
+RestartSec=20
 
-# Logging via journald
+# Logging via journald (read with: journalctl --user -u dynamic_lock -f)
 StandardOutput=journal
 StandardError=journal
 

@@ -1,7 +1,15 @@
 #!/bin/bash
 #
-# dynamic_lock.sh — bluetooth proximity screen lock
-# checks if phone is connected via bluetoothctl, locks screen if it drops
+# dynamic_lock.sh — bluetooth proximity screen lock (v3.0)
+# Monitors phone via bluetoothctl; locks screen when it disconnects.
+#
+# Fixes in v3.0:
+#   - Interruptible sleep (sleep & wait) for instant shutdown
+#   - Signal trap for SIGTERM/SIGINT/SIGHUP
+#   - timeout on bluetoothctl to prevent hangs
+#   - Fixed operator precedence on sleep branch
+#   - BT adapter power check to prevent false locks during bluetoothd restart
+#   - Always reset MISS on wake to prevent false locks after deep sleep
 #
 
 CONFIG_FILE="$HOME/.config/dynamic_lock/config"
@@ -11,12 +19,26 @@ PAUSE_FILE="$HOME/.dynamic_lock_pause"
 WAKE_FILE="/tmp/dynamic_lock_wake_$UID"
 LOG_TAG="dynamic_lock"
 
+# ── signal handling ───────────────────────────────────────────────────────────
+# Catch SIGTERM (systemd stop), SIGINT (Ctrl-C), SIGHUP so we exit instantly
+# instead of making systemd wait 90s during shutdown/suspend.
+RUNNING=1
+cleanup() {
+    log "received shutdown signal, exiting cleanly"
+    RUNNING=0
+    # kill any backgrounded sleep so we don't leave orphans
+    kill %% 2>/dev/null
+    # preserve STATE_FILE so we remember SEEN=1 across restarts
+    rm -f "$LOCK_FILE" "$WAKE_FILE" 2>/dev/null
+    exit 0
+}
+trap cleanup SIGTERM SIGINT SIGHUP
+
 # defaults
 PHONE_MAC=""
 POLL_INTERVAL=1
 MISS_THRESHOLD=3
 NOTIFY=1
-LOCK_CMD=""
 
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
@@ -54,21 +76,32 @@ load_state() {
     fi
 }
 
-# connection check — passive, no ping, no sudo
+# ── interruptible sleep ──────────────────────────────────────────────────────
+# Plain 'sleep N' blocks signal handling in bash. By backgrounding sleep
+# and using 'wait', the trap fires immediately when a signal arrives.
+isleep() {
+    sleep "$1" &
+    wait $!
+}
+
+# ── bluetooth checks ─────────────────────────────────────────────────────────
+
+# Check if the BT adapter itself is powered on.
+# Prevents false locks when bluetoothd restarts or adapter is temporarily down.
+is_bt_adapter_up() {
+    timeout 2 bluetoothctl show 2>/dev/null | grep -q "Powered: yes"
+}
+
+# Check if the phone is connected.
+# timeout prevents hang if BT adapter is down during shutdown.
 is_connected() {
-    bluetoothctl info "$PHONE_MAC" 2>/dev/null | grep -q "Connected: yes"
+    timeout 3 bluetoothctl info "$PHONE_MAC" 2>/dev/null | grep -q "Connected: yes"
 }
 
 # lock screen
 lock_session() {
     log "locking session"
     notify "screen locked" "phone disconnected"
-
-    if [[ -n "$LOCK_CMD" ]]; then
-        log "running custom lock command: $LOCK_CMD"
-        eval "$LOCK_CMD" &>/dev/null && return
-        log "custom lock command failed, trying fallbacks"
-    fi
 
     # try loginctl first, then fallbacks
     local session
@@ -90,7 +123,9 @@ lock_session() {
 }
 
 # suspend/wake — reset miss counter after lid open so we don't
-# false-lock while BT adapter is still reconnecting
+# false-lock while BT adapter is still reconnecting.
+# Always resets MISS on wake regardless of suspend duration, because the
+# BT adapter needs time to re-initialize after any sleep.
 handle_wake() {
     local now last=0 delta
     now=$(awk '{print int($1)}' /proc/uptime)
@@ -100,11 +135,12 @@ handle_wake() {
     local normal_max=$(( POLL_INTERVAL + 15 ))
     delta=$(( now - last ))
 
-    # normal tick
+    # normal tick — no gap detected
     [[ $last -eq 0 ]] || [[ $delta -lt $normal_max && $delta -ge 0 ]] && return
 
-    # woke from suspend
-    if [[ $delta -lt 300 && $MISS -gt 0 ]]; then
+    # woke from suspend (any duration) — always reset miss counter
+    # BT adapter needs time to reconnect after sleep, don't false-lock
+    if [[ $MISS -gt 0 ]]; then
         log "wake detected (${delta}s gap), resetting miss counter"
         MISS=0
         save_state
@@ -119,8 +155,16 @@ _PAUSED=0
 PREV_SEEN=$SEEN
 PREV_LOCKED=$LOCKED
 
-while true; do
-    [[ $LOCKED -eq 1 ]] && sleep 5 || sleep "$POLL_INTERVAL"
+while [[ $RUNNING -eq 1 ]]; do
+    # FIX: proper if/else instead of && || to avoid operator precedence bug
+    if [[ $LOCKED -eq 1 ]]; then
+        isleep 5
+    else
+        isleep "$POLL_INTERVAL"
+    fi
+
+    # check if we were signalled during sleep
+    [[ $RUNNING -eq 1 ]] || break
 
     handle_wake
 
@@ -130,6 +174,14 @@ while true; do
         continue
     fi
     [[ "$_PAUSED" -eq 1 ]] && { log "resumed"; notify "dynamic lock resumed" ""; _PAUSED=0; MISS=0; }
+
+    # FIX: check if BT adapter is up before counting misses.
+    # If the adapter is down (bluetoothd restart, system update, etc.),
+    # don't count misses — the phone isn't really "gone", BT is just offline.
+    if ! is_bt_adapter_up; then
+        [[ $MISS -gt 0 ]] && { log "BT adapter down, resetting miss counter"; MISS=0; }
+        continue
+    fi
 
     if is_connected; then
         # phone is here
@@ -155,3 +207,5 @@ while true; do
         PREV_SEEN=$SEEN; PREV_LOCKED=$LOCKED
     fi
 done
+
+log "exited main loop"
