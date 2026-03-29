@@ -1,0 +1,26 @@
+[Unit]
+Description=Dynamic Lock — Bluetooth proximity screen lock
+After=bluetooth.target graphical-session.target
+Wants=bluetooth.target graphical-session.target
+
+# Prevent infinite restart storms
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dynamic_lock.sh
+
+# DBus session address — required for loginctl and notify-send
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
+
+# Restart on failure, not on clean exit
+Restart=on-failure
+RestartSec=10
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
