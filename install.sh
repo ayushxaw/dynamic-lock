@@ -9,11 +9,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PHONE_MAC=""
 
-echo ""
+echo -e "\033[1;36m"
 echo "╔══════════════════════════════════════════╗"
 echo "║     🔒 Dynamic Lock — Installer          ║"
-echo "║     Windows-style Bluetooth lock          ║"
+echo "║     Windows-style Bluetooth lock         ║"
 echo "╚══════════════════════════════════════════╝"
+echo -e "\033[0m"
 echo ""
 
 # ── Step 1: Check bluetoothctl ─────────────────────────────────────────────────
@@ -71,6 +72,10 @@ MISS_THRESHOLD=3
 
 # Desktop notifications: 1 = enabled, 0 = silent
 NOTIFY=1
+
+# Custom lock command (optional, overrides loginctl/gnome-screensaver)
+# e.g. LOCK_CMD="custom-lock-script.sh"
+LOCK_CMD=""
 EOF
 fi
 echo "✅ Config written to ~/.config/dynamic_lock/config"
@@ -83,11 +88,11 @@ systemctl --user enable --now dynamic_lock.service
 echo "✅ Service installed and started"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
-echo ""
+echo -e "\033[1;32m"
 echo "╔══════════════════════════════════════════╗"
-echo "║     ✅ Installation complete!             ║"
+echo "║     ✅ Installation complete!            ║"
 echo "╚══════════════════════════════════════════╝"
-echo ""
+echo -e "\033[0m"
 echo "  Status:    systemctl --user status dynamic_lock"
 echo "  Logs:      journalctl --user -u dynamic_lock -f"
 echo "  Pause:     touch ~/.dynamic_lock_pause"

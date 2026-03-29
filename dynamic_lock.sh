@@ -16,6 +16,7 @@ PHONE_MAC=""
 POLL_INTERVAL=1
 MISS_THRESHOLD=3
 NOTIFY=1
+LOCK_CMD=""
 
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
@@ -62,6 +63,12 @@ is_connected() {
 lock_session() {
     log "locking session"
     notify "screen locked" "phone disconnected"
+
+    if [[ -n "$LOCK_CMD" ]]; then
+        log "running custom lock command: $LOCK_CMD"
+        eval "$LOCK_CMD" &>/dev/null && return
+        log "custom lock command failed, trying fallbacks"
+    fi
 
     # try loginctl first, then fallbacks
     local session
