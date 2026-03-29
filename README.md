@@ -48,7 +48,7 @@ Phone connected ──► Phone disconnects ──► 3 seconds ──► 🔒 S
 ### One-line install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/dynamic-lock.git
+git clone https://github.com/ayushxaw/dynamic-lock.git
 cd dynamic-lock
 bash install.sh
 ```
