@@ -25,7 +25,7 @@ dynamic-lock uses physical proximity instead of idle time. your phone is your ke
 3. once locked, the script scans for your phone and auto-reconnects when it comes back
 4. uses exponential backoff (45s → 90s → 3min → 5min) to save battery if you're genuinely away
 
-no root needed. no pinging. no active scanning during normal monitoring. battery impact is ~0.15W (~1% of total laptop power).
+no root needed. no pinging. no active scanning during normal monitoring. battery impact is completely negligible.
 
 ## quick start
 
