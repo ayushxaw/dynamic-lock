@@ -101,30 +101,28 @@ is_connected() {
 }
 
 # Try to reconnect to the phone.
-# Android phones don't accept incoming classic BT connections from PCs
-# (unlike earbuds/mice which use A2DP/HID auto-reconnect profiles).
-# Instead, we trigger a BLE scan — this makes BlueZ discover the phone's
-# advertisement and auto-reconnect to it as a trusted paired device.
-# This is the same mechanism that makes earbuds auto-connect.
+# The key insight: Android phones ignore incoming classic BT connections
+# from PCs UNLESS you scan first. The BLE scan "wakes up" the phone's
+# BT stack, after which bluetoothctl connect succeeds immediately.
+# Sequence: scan → connect → verify
 try_reconnect() {
     [[ "$AUTO_RECONNECT" -eq 1 ]] || return 1
     log "scanning for $PHONE_MAC"
 
-    # Brief BLE scan — triggers BlueZ to see the phone and auto-reconnect
-    timeout 5 bluetoothctl --timeout 4 scan on &>/dev/null
+    # Step 1: BLE scan to wake up the phone's BT stack (~5 seconds)
+    timeout 6 bluetoothctl --timeout 5 scan on &>/dev/null
+    sleep 1
 
-    # Also try classic name resolution — this pages the phone directly
-    timeout 3 hcitool name "$PHONE_MAC" &>/dev/null 2>&1
+    # Step 2: Now connect — phone is receptive after being scanned
+    log "connecting to $PHONE_MAC"
+    timeout 10 bluetoothctl connect "$PHONE_MAC" &>/dev/null
 
-    # Small delay for BlueZ to process the reconnection
-    sleep 2
-
-    # Check if it worked
+    # Step 3: Verify
     if is_connected; then
-        log "phone reconnected via scan"
+        log "phone reconnected successfully"
         return 0
     else
-        log "phone not found in scan"
+        log "reconnect failed — phone may be out of range"
         return 1
     fi
 }
