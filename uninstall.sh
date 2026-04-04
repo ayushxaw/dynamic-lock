@@ -1,39 +1,46 @@
 #!/bin/bash
-# =============================================================================
-# uninstall.sh — remove Dynamic Lock completely
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# uninstall.sh — completely remove dynamic-lock from your system
+# ─────────────────────────────────────────────────────────────────────────────
 
-set -e
+set -euo pipefail
+
+R='\033[0;31m'   G='\033[0;32m'   Y='\033[0;33m'
+B='\033[1m'      N='\033[0m'
+
+ok()   { echo -e "  ${G}✔${N} $*"; }
+warn() { echo -e "  ${Y}⚠${N} $*"; }
 
 echo ""
-echo "🗑  Uninstalling Dynamic Lock..."
+echo -e "${R}${B}  🗑  Uninstalling Dynamic Lock${N}"
 echo ""
 
-# Stop and disable service
-systemctl --user stop dynamic_lock.service 2>/dev/null || true
-systemctl --user disable dynamic_lock.service 2>/dev/null || true
-echo "✅ Service stopped and disabled"
+# stop and disable service
+systemctl --user stop dynamic_lock.service 2>/dev/null && ok "service stopped" || true
+systemctl --user disable dynamic_lock.service 2>/dev/null && ok "service disabled" || true
 
-# Remove files
-rm -f "$HOME/.local/bin/dynamic_lock.sh"
-rm -f "$HOME/.config/systemd/user/dynamic_lock.service"
+# remove files
+rm -f "$HOME/.local/bin/dynamic_lock.sh"      && ok "removed script"
+rm -f "$HOME/.config/systemd/user/dynamic_lock.service" && ok "removed service file"
+
+# clean temp files
 rm -f "/tmp/dynamic_lock_state_$UID"
 rm -f "/tmp/dynamic_lock_$UID.lock"
 rm -f "/tmp/dynamic_lock_wake_$UID"
-echo "✅ Files removed"
+rm -f "$HOME/.dynamic_lock_pause"
+ok "cleaned temp files"
 
-# Remove old l2ping sudoers rule if it exists (from v2)
+# remove old sudoers rule (from legacy versions)
 if [[ -f "/etc/sudoers.d/dynamic_lock" ]]; then
-    sudo rm -f /etc/sudoers.d/dynamic_lock 2>/dev/null && \
-        echo "✅ Removed old sudoers rule (from v2)" || \
-        echo "⚠️  Could not remove /etc/sudoers.d/dynamic_lock (run with sudo)"
+    sudo rm -f /etc/sudoers.d/dynamic_lock 2>/dev/null && ok "removed legacy sudoers rule" || \
+        warn "could not remove /etc/sudoers.d/dynamic_lock (run with sudo)"
 fi
 
-systemctl --user daemon-reload
+systemctl --user daemon-reload 2>/dev/null
 
 echo ""
-echo "✅ Dynamic Lock uninstalled."
+echo -e "  ${G}${B}✔ Dynamic Lock uninstalled${N}"
 echo ""
-echo "Note: Config preserved at ~/.config/dynamic_lock/config"
-echo "      Delete it manually if you don't want it:  rm -rf ~/.config/dynamic_lock"
+echo -e "  config preserved at: ${B}~/.config/dynamic_lock/config${N}"
+echo -e "  to delete it too:    ${B}rm -rf ~/.config/dynamic_lock${N}"
 echo ""
