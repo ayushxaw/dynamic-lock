@@ -117,6 +117,9 @@ RECONNECT_INTERVAL=45
 # grace period after reconnect — prevents rapid re-lock (seconds)
 GRACE_PERIOD=10
 
+# wake grace period — prevents instant lock right after waking laptop (seconds)
+WAKE_GRACE_PERIOD=15
+
 # custom lock command (leave empty for auto-detection)
 # LOCK_CMD="swaylock -f"            # sway
 # LOCK_CMD="i3lock -c 000000"       # i3

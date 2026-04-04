@@ -109,6 +109,7 @@ RECONNECT_INTERVAL=45
 MAX_RECONNECT_INTERVAL=300
 LOCK_CMD=""
 GRACE_PERIOD=10
+WAKE_GRACE_PERIOD=15
 
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
@@ -129,6 +130,8 @@ fi
 [[ "$MISS_THRESHOLD" -gt 30 ]] 2>/dev/null && MISS_THRESHOLD=30
 [[ "$GRACE_PERIOD" -lt 0 ]] 2>/dev/null    && GRACE_PERIOD=0
 [[ "$GRACE_PERIOD" -gt 120 ]] 2>/dev/null  && GRACE_PERIOD=120
+[[ "$WAKE_GRACE_PERIOD" -lt 0 ]] 2>/dev/null   && WAKE_GRACE_PERIOD=0
+[[ "$WAKE_GRACE_PERIOD" -gt 300 ]] 2>/dev/null && WAKE_GRACE_PERIOD=300
 
 command -v bluetoothctl &>/dev/null || { echo "error: bluetoothctl not found"; exit 1; }
 
@@ -360,6 +363,8 @@ handle_wake() {
     RECONNECT_FAILURES=0; LAST_RECONNECT_TIME=0
     # force adapter re-check after wake
     _ADAPTER_CHECK_CTR=$_ADAPTER_CHECK_EVERY
+    # prevent immediate lock right after waking up while BT is connecting
+    GRACE_UNTIL=$(( _UPTIME + WAKE_GRACE_PERIOD ))
 }
 
 # ── main loop ─────────────────────────────────────────────────────────────────
