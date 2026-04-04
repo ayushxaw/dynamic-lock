@@ -32,6 +32,18 @@ echo "│     auto-lock when phone disconnects     │"
 echo "└──────────────────────────────────────────┘"
 echo -e "${N}"
 
+# ── pre-checks ────────────────────────────────────────────────────────────────
+
+# don't run as root — user services need to run as your user
+if [[ $EUID -eq 0 ]]; then
+    fail "don't run this as root. run as your normal user: bash install.sh"
+fi
+
+# bash 4+ needed for mapfile
+if [[ ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    fail "bash 4+ required (you have bash $BASH_VERSION). upgrade with your package manager."
+fi
+
 # ── step 1: requirements ─────────────────────────────────────────────────────
 step 1 "Checking system requirements"
 
@@ -198,8 +210,19 @@ NOTIFY=1
 # auto-reconnect when phone comes back in range (1 = on, 0 = off)
 AUTO_RECONNECT=1
 
-# seconds between reconnect attempts (increases automatically via backoff)
+# seconds between reconnect attempts (increases with backoff)
 RECONNECT_INTERVAL=45
+
+# grace period after reconnect (seconds) — prevents rapid re-lock
+# if the connection is briefly unstable after re-connecting
+GRACE_PERIOD=10
+
+# custom lock command (leave empty to use automatic detection)
+# examples:
+#   LOCK_CMD="swaylock -f"              # sway
+#   LOCK_CMD="i3lock -c 000000"         # i3
+#   LOCK_CMD="loginctl lock-session"    # generic
+LOCK_CMD=""
 EOF
     ok "config written to ~/.config/dynamic_lock/config"
 fi

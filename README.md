@@ -30,7 +30,13 @@ no root needed. no pinging. no active scanning during normal monitoring. battery
 ## quick start
 
 ```bash
-# clone and install (takes 30 seconds)
+# one-liner (clone + install)
+git clone https://github.com/ayushxaw/dynamic-lock.git && cd dynamic-lock && bash install.sh
+```
+
+or step by step:
+
+```bash
 git clone https://github.com/ayushxaw/dynamic-lock.git
 cd dynamic-lock
 bash install.sh
@@ -107,6 +113,15 @@ AUTO_RECONNECT=1
 
 # initial reconnect interval in seconds (backs off automatically)
 RECONNECT_INTERVAL=45
+
+# grace period after reconnect — prevents rapid re-lock (seconds)
+GRACE_PERIOD=10
+
+# custom lock command (leave empty for auto-detection)
+# LOCK_CMD="swaylock -f"            # sway
+# LOCK_CMD="i3lock -c 000000"       # i3
+# LOCK_CMD="loginctl lock-session"  # generic
+LOCK_CMD=""
 ```
 
 restart after changes: `systemctl --user restart dynamic_lock`

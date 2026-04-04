@@ -18,11 +18,15 @@ Type=simple
 ExecStart=%h/.local/bin/dynamic_lock.sh
 
 # fast shutdown — script traps SIGTERM and exits immediately,
-# but this acts as a safety net in case it doesn't
+# but this is a safety net in case it doesn't
 TimeoutStopSec=5
 KillSignal=SIGTERM
 
-# dbus session address — needed for loginctl lock-session and notify-send
+# resource limits — safety net against bugs or runaway processes
+MemoryMax=50M
+CPUQuota=10%
+
+# dbus session address — needed for loginctl and notify-send
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
 
 # restart on crash, not on clean exit

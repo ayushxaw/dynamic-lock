@@ -7,7 +7,7 @@
 # when the phone reconnects, the lock re-arms — just like windows dynamic lock.
 #
 # usage:
-#   dynamic_lock.sh              run the daemon (normally started via systemd)
+#   dynamic_lock.sh              run the daemon (normally via systemd)
 #   dynamic_lock.sh --status     show current state (armed/locked/scanning)
 #   dynamic_lock.sh --help       show this help
 #   dynamic_lock.sh --version    show version
@@ -18,7 +18,7 @@
 # resume:  rm ~/.dynamic_lock_pause
 #
 
-VERSION="4.1.0"
+VERSION="4.2.0"
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 
@@ -37,7 +37,8 @@ show_status() {
     local pause_file="$HOME/.dynamic_lock_pause"
     local pid
 
-    pid=$(pgrep -f "dynamic_lock.sh$" | grep -v "$$" | head -1)
+    # exclude our own PID and parent to avoid false matches
+    pid=$(pgrep -xf "/bin/bash.*dynamic_lock.sh\$" 2>/dev/null | grep -vE "^($$|$PPID)$" | head -1)
 
     if [[ -z "$pid" ]]; then
         echo "● dynamic_lock is not running"
@@ -50,16 +51,15 @@ show_status() {
         echo "  State:   PAUSED"
     elif [[ -f "$state_file" ]]; then
         read -r s l m < "$state_file" 2>/dev/null
-        if [[ "$l" -eq 1 ]]; then
+        if [[ "${l:-0}" -eq 1 ]]; then
             echo "  State:   LOCKED (scanning for phone)"
-        elif [[ "$s" -eq 1 ]]; then
+        elif [[ "${s:-0}" -eq 1 ]]; then
             echo "  State:   ARMED (monitoring phone)"
         else
             echo "  State:   WAITING (phone not yet seen)"
         fi
     fi
 
-    # show last few log lines
     echo "  Recent:"
     journalctl -t dynamic_lock -n 5 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
     exit 0
@@ -90,11 +90,13 @@ RECONNECT_PID=""
 cleanup() {
     log "shutting down"
     RUNNING=0
-    # kill any running reconnect subshell
+    # kill reconnect subshell AND all its children (bluetoothctl, timeout, sleep)
     if [[ -n "$RECONNECT_PID" ]]; then
-        kill "$RECONNECT_PID" 2>/dev/null
+        kill -- -"$RECONNECT_PID" 2>/dev/null  # kill process group
+        kill "$RECONNECT_PID" 2>/dev/null      # fallback if group kill fails
         wait "$RECONNECT_PID" 2>/dev/null
     fi
+    # kill backgrounded sleep from isleep
     kill %% 2>/dev/null
     rm -f "$LOCK_FILE" "$WAKE_FILE" 2>/dev/null
     exit 0
@@ -110,10 +112,12 @@ NOTIFY=1
 AUTO_RECONNECT=1
 RECONNECT_INTERVAL=45
 MAX_RECONNECT_INTERVAL=300
+LOCK_CMD=""                 # custom lock command (overrides all fallbacks)
+GRACE_PERIOD=10             # seconds after reconnect before counting misses
 
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-# validate required config
+# validate
 if [[ -z "$PHONE_MAC" ]]; then
     echo "error: PHONE_MAC not set in $CONFIG_FILE"
     echo "       run: bluetoothctl devices"
@@ -121,19 +125,21 @@ if [[ -z "$PHONE_MAC" ]]; then
 fi
 
 if ! [[ "$PHONE_MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-    echo "error: invalid MAC address format: $PHONE_MAC"
+    echo "error: invalid MAC format: $PHONE_MAC"
     exit 1
 fi
 
-# clamp config values to sane ranges
+# clamp to sane ranges
 [[ "$POLL_INTERVAL" -lt 1 ]] 2>/dev/null   && POLL_INTERVAL=1
 [[ "$POLL_INTERVAL" -gt 60 ]] 2>/dev/null  && POLL_INTERVAL=60
 [[ "$MISS_THRESHOLD" -lt 1 ]] 2>/dev/null  && MISS_THRESHOLD=1
 [[ "$MISS_THRESHOLD" -gt 30 ]] 2>/dev/null && MISS_THRESHOLD=30
+[[ "$GRACE_PERIOD" -lt 0 ]] 2>/dev/null    && GRACE_PERIOD=0
+[[ "$GRACE_PERIOD" -gt 60 ]] 2>/dev/null   && GRACE_PERIOD=60
 
 command -v bluetoothctl &>/dev/null || { echo "error: bluetoothctl not found"; exit 1; }
 
-# single instance — prevents duplicate daemons
+# single instance
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "error: already running"; exit 1; }
 
@@ -145,7 +151,6 @@ log() {
 
 notify() {
     [[ "$NOTIFY" -eq 1 ]] || return
-    # timeout prevents hang if notification daemon is stuck
     timeout 2 notify-send -a "Dynamic Lock" -i dialog-password "$1" "$2" 2>/dev/null || true
 }
 
@@ -169,21 +174,34 @@ isleep() {
     wait $!
 }
 
-# ── bluetooth ─────────────────────────────────────────────────────────────────
-
-# check if the bt adapter is powered on.
-# prevents false locks when bluetoothd restarts or adapter goes down.
-is_bt_adapter_up() {
-    timeout 2 bluetoothctl show 2>/dev/null | grep -q "Powered: yes"
+# read system uptime as integer seconds — pure bash, no awk fork
+get_uptime() {
+    local raw
+    read -r raw _ < /proc/uptime 2>/dev/null
+    echo "${raw%%.*}"
 }
 
-# check if the phone is connected. timeout prevents hangs during shutdown.
-is_connected() {
-    timeout 3 bluetoothctl info "$PHONE_MAC" 2>/dev/null | grep -q "Connected: yes"
+# ── bluetooth ─────────────────────────────────────────────────────────────────
+
+# check adapter + connection in one pass.
+# uses bash pattern matching instead of piping to grep — saves 2 forks per tick.
+# sets BT_ADAPTER_UP and BT_CONNECTED globals.
+poll_bluetooth() {
+    BT_ADAPTER_UP=0
+    BT_CONNECTED=0
+
+    local show_out
+    show_out=$(timeout 2 bluetoothctl show 2>/dev/null) || return
+    [[ "$show_out" == *"Powered: yes"* ]] && BT_ADAPTER_UP=1
+
+    [[ $BT_ADAPTER_UP -eq 1 ]] || return
+
+    local info_out
+    info_out=$(timeout 3 bluetoothctl info "$PHONE_MAC" 2>/dev/null) || return
+    [[ "$info_out" == *"Connected: yes"* ]] && BT_CONNECTED=1
 }
 
 # exponential backoff: 45 → 90 → 180 → 300(cap).
-# reduces battery usage when the phone is genuinely out of range.
 get_backoff_interval() {
     local shift=$RECONNECT_FAILURES
     [[ $shift -gt 3 ]] && shift=3
@@ -195,27 +213,26 @@ get_backoff_interval() {
 # reconnect to the phone.
 #
 # android phones don't auto-accept incoming BT connections from PCs the
-# way they do for earbuds (which use A2DP/HFP auto-reconnect). the trick
-# is to trigger a BLE scan first — this "wakes up" the phone's BT stack,
+# way they do for earbuds (A2DP/HFP auto-reconnect). the trick is to
+# trigger a BLE scan first — this "wakes up" the phone's bluetooth,
 # after which bluetoothctl connect succeeds immediately.
 #
-# the scan+connect runs in a subshell so SIGTERM can interrupt it via wait
-# (otherwise a shutdown would block for up to 17 seconds).
-#
-# after connecting, audio output is restored to prevent PipeWire/PulseAudio
-# from routing laptop audio through the phone speaker.
+# runs in a subshell so SIGTERM can interrupt via wait.
+# preserves audio output to prevent PipeWire hijacking to phone speaker.
 try_reconnect() {
     [[ "$AUTO_RECONNECT" -eq 1 ]] || return 1
     log "scanning for $PHONE_MAC"
 
-    # save current audio sink
+    # save current audio sink before connecting
     local prev_sink=""
     command -v pactl &>/dev/null && prev_sink=$(pactl get-default-sink 2>/dev/null)
 
-    # run in subshell — killable on shutdown
+    # run in subshell — can be killed cleanly on shutdown
     (
+        # BLE scan wakes up the phone's BT stack
         timeout 6 bluetoothctl --timeout 5 scan on &>/dev/null
         sleep 1
+        # phone is receptive after scan
         timeout 10 bluetoothctl connect "$PHONE_MAC" &>/dev/null
     ) &
     RECONNECT_PID=$!
@@ -224,7 +241,7 @@ try_reconnect() {
 
     [[ $RUNNING -eq 1 ]] || return 1
 
-    # restore audio if it was hijacked
+    # restore audio if PipeWire auto-switched to phone
     if [[ -n "$prev_sink" ]] && command -v pactl &>/dev/null; then
         local curr_sink
         curr_sink=$(pactl get-default-sink 2>/dev/null)
@@ -234,10 +251,13 @@ try_reconnect() {
         fi
     fi
 
-    # verify connection is stable (wait 2s then re-check)
-    if is_connected; then
-        sleep 2
-        if is_connected; then
+    # verify connection is stable (brief re-check)
+    poll_bluetooth
+    if [[ $BT_CONNECTED -eq 1 ]]; then
+        isleep 2  # interruptible stability wait
+        [[ $RUNNING -eq 1 ]] || return 1
+        poll_bluetooth
+        if [[ $BT_CONNECTED -eq 1 ]]; then
             log "phone reconnected (stable)"
             return 0
         fi
@@ -249,28 +269,35 @@ try_reconnect() {
 }
 
 # ── lock screen ───────────────────────────────────────────────────────────────
-# tries multiple lock commands in order of preference.
-# works on GNOME (wayland/x11), KDE, XFCE, and most systemd distros.
+# tries custom command first, then standard lock methods.
+# works on GNOME, KDE, XFCE, i3, sway, and most systemd desktops.
 
 lock_session() {
     log "locking session"
     notify "screen locked" "phone disconnected"
 
-    # method 1: loginctl (works on most systemd distros)
+    # custom lock command (from config)
+    if [[ -n "$LOCK_CMD" ]]; then
+        log "running custom lock: $LOCK_CMD"
+        eval "$LOCK_CMD" &>/dev/null && return
+        log "custom lock failed, trying fallbacks"
+    fi
+
+    # loginctl (most systemd distros)
     local session
     session=$(loginctl show-user "$USER" --property=Sessions --value 2>/dev/null \
               | tr ' ' '\n' | grep -m1 '[0-9]')
     [[ -n "$session" ]] && loginctl lock-session "$session" && return
 
-    # method 2: GNOME screensaver dbus
+    # GNOME screensaver dbus
     dbus-send --session --dest=org.gnome.ScreenSaver --type=method_call \
         /org/gnome/ScreenSaver org.gnome.ScreenSaver.Lock &>/dev/null && return
 
-    # method 3: gnome-screensaver-command
+    # gnome-screensaver-command
     command -v gnome-screensaver-command &>/dev/null \
         && gnome-screensaver-command --lock && return
 
-    # method 4: xdg-screensaver (generic fallback)
+    # xdg-screensaver (generic)
     command -v xdg-screensaver &>/dev/null \
         && xdg-screensaver lock && return
 
@@ -278,13 +305,10 @@ lock_session() {
 }
 
 # ── suspend/wake detection ────────────────────────────────────────────────────
-# detects resume from suspend by checking for gaps in /proc/uptime.
-# resets miss counter and reconnect backoff so we don't false-lock while
-# the bluetooth adapter is still re-initializing after sleep.
 
 handle_wake() {
     local now last=0 delta
-    now=$(awk '{print int($1)}' /proc/uptime)
+    now=$(get_uptime)
     [[ -f "$WAKE_FILE" ]] && last=$(cat "$WAKE_FILE" 2>/dev/null)
     echo "$now" > "$WAKE_FILE"
 
@@ -293,18 +317,10 @@ handle_wake() {
 
     [[ $last -eq 0 ]] || [[ $delta -lt $normal_max && $delta -ge 0 ]] && return
 
-    # resumed from suspend
     log "resume detected (${delta}s gap)"
 
-    if [[ $MISS -gt 0 ]]; then
-        MISS=0
-        save_state
-    fi
-
-    if [[ $RECONNECT_FAILURES -gt 0 ]]; then
-        RECONNECT_FAILURES=0
-        LAST_RECONNECT_TIME=0
-    fi
+    MISS=0; save_state
+    RECONNECT_FAILURES=0; LAST_RECONNECT_TIME=0
 }
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -317,6 +333,7 @@ PREV_SEEN=$SEEN
 PREV_LOCKED=$LOCKED
 LAST_RECONNECT_TIME=0
 RECONNECT_FAILURES=0
+GRACE_UNTIL=0               # timestamp until which we skip miss counting
 
 while [[ $RUNNING -eq 1 ]]; do
 
@@ -337,14 +354,16 @@ while [[ $RUNNING -eq 1 ]]; do
     fi
     [[ "$_PAUSED" -eq 1 ]] && { log "resumed"; notify "resumed" "dynamic lock active"; _PAUSED=0; MISS=0; }
 
-    # ── bt adapter check ──────────────────────────────────────────────────
-    if ! is_bt_adapter_up; then
+    # ── poll bluetooth (combined check — saves forks) ─────────────────────
+    poll_bluetooth
+
+    if [[ $BT_ADAPTER_UP -eq 0 ]]; then
         [[ $MISS -gt 0 ]] && { log "adapter down, resetting misses"; MISS=0; }
         continue
     fi
 
-    # ── connection check ──────────────────────────────────────────────────
-    if is_connected; then
+    # ── connection logic ──────────────────────────────────────────────────
+    if [[ $BT_CONNECTED -eq 1 ]]; then
         [[ $SEEN -eq 0 ]] && { log "phone detected"; notify "armed" "monitoring phone"; }
         [[ $LOCKED -eq 1 ]] && { log "phone returned, re-armed"; notify "re-armed" "phone reconnected"; }
         SEEN=1; MISS=0; LOCKED=0
@@ -352,9 +371,20 @@ while [[ $RUNNING -eq 1 ]]; do
     else
         [[ $SEEN -eq 0 ]] && continue
 
-        # already locked — try reconnecting with backoff
+        # grace period — don't count misses right after reconnect
+        # prevents rapid lock-unlock-lock if connection is briefly unstable
+        if [[ $GRACE_UNTIL -gt 0 ]]; then
+            local _now_g
+            _now_g=$(get_uptime)
+            if [[ $_now_g -lt $GRACE_UNTIL ]]; then
+                continue
+            fi
+            GRACE_UNTIL=0
+        fi
+
+        # already locked — reconnect with backoff
         if [[ $LOCKED -eq 1 ]]; then
-            _now=$(awk '{print int($1)}' /proc/uptime)
+            _now=$(get_uptime)
             _elapsed=$(( _now - LAST_RECONNECT_TIME ))
             _backoff=$(get_backoff_interval)
 
@@ -364,6 +394,8 @@ while [[ $RUNNING -eq 1 ]]; do
                     notify "reconnected" "auto-reconnect succeeded"
                     SEEN=1; MISS=0; LOCKED=0
                     RECONNECT_FAILURES=0
+                    # set grace period so first brief glitch doesn't re-lock
+                    GRACE_UNTIL=$(( $(get_uptime) + GRACE_PERIOD ))
                 else
                     (( RECONNECT_FAILURES++ ))
                     _next=$(get_backoff_interval)
@@ -384,7 +416,7 @@ while [[ $RUNNING -eq 1 ]]; do
         fi
     fi
 
-    # persist state on transitions
+    # save on state transitions
     if [[ $SEEN -ne $PREV_SEEN || $LOCKED -ne $PREV_LOCKED ]]; then
         save_state
         PREV_SEEN=$SEEN; PREV_LOCKED=$LOCKED
