@@ -216,9 +216,9 @@ restart after changes: `systemctl --user restart dynamic_lock`
 
 | component | power | notes |
 |-----------|-------|-------|
-| normal monitoring | ~0.15W | polling `bluetoothctl info` every 1s |
+| normal monitoring | ~0.08W | polling via D-Bus directly (0 forks, 3x faster than bluetoothctl) |
 | reconnect scan | ~0.3W burst | BLE scan for ~5s, then connect |
-| total impact | **~1% of laptop power** | negligible vs screen (~5W) and CPU (~8W) |
+| total impact | **< 1% of laptop power** | completely negligible vs screen (~5W) and CPU (~8W) |
 
 ## uninstall
 
