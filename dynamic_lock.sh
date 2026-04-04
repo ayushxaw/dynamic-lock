@@ -39,6 +39,8 @@ PHONE_MAC=""
 POLL_INTERVAL=1
 MISS_THRESHOLD=3
 NOTIFY=1
+AUTO_RECONNECT=1
+RECONNECT_INTERVAL=45  # seconds between reconnect attempts when locked
 
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
@@ -98,6 +100,30 @@ is_connected() {
     timeout 3 bluetoothctl info "$PHONE_MAC" 2>/dev/null | grep -q "Connected: yes"
 }
 
+# Try to reconnect to the phone.
+# First cancels any pending connect (avoids "Operation already in progress"),
+# then attempts a fresh connection.
+# Returns 0 if connected, 1 if not.
+try_reconnect() {
+    [[ "$AUTO_RECONNECT" -eq 1 ]] || return 1
+
+    # cancel any stale/pending connection attempt in BlueZ
+    timeout 3 bluetoothctl disconnect "$PHONE_MAC" &>/dev/null
+    sleep 1
+
+    log "attempting reconnect to $PHONE_MAC"
+    local result
+    result=$(timeout 10 bluetoothctl connect "$PHONE_MAC" 2>&1)
+
+    if echo "$result" | grep -q "Connection successful"; then
+        log "bluetoothctl reports connection successful"
+        return 0
+    else
+        log "connect attempt finished: $(echo "$result" | tail -1)"
+        return 1
+    fi
+}
+
 # lock screen
 lock_session() {
     log "locking session"
@@ -154,6 +180,7 @@ log "started: $PHONE_MAC poll=${POLL_INTERVAL}s threshold=$MISS_THRESHOLD"
 _PAUSED=0
 PREV_SEEN=$SEEN
 PREV_LOCKED=$LOCKED
+LAST_RECONNECT_TIME=0
 
 while [[ $RUNNING -eq 1 ]]; do
     # FIX: proper if/else instead of && || to avoid operator precedence bug
@@ -191,7 +218,21 @@ while [[ $RUNNING -eq 1 ]]; do
     else
         # phone gone
         [[ $SEEN -eq 0 ]] && continue  # never seen, do nothing
-        [[ $LOCKED -eq 1 ]] && continue  # already locked, no spam
+
+        # already locked — try auto-reconnect periodically using timestamps
+        if [[ $LOCKED -eq 1 ]]; then
+            _now=$(awk '{print int($1)}' /proc/uptime)
+            _elapsed=$(( _now - LAST_RECONNECT_TIME ))
+            if [[ $_elapsed -ge $RECONNECT_INTERVAL ]]; then
+                LAST_RECONNECT_TIME=$_now
+                if try_reconnect; then
+                    log "reconnected to phone!"
+                    notify "phone reconnected" "auto-reconnect succeeded"
+                    SEEN=1; MISS=0; LOCKED=0
+                fi
+            fi
+            continue
+        fi
 
         (( MISS++ ))
         log "miss $MISS/$MISS_THRESHOLD"
