@@ -243,8 +243,8 @@ RECONNECT_INTERVAL=45
 GRACE_PERIOD=10
 
 # wake grace period — prevents instant lock right after waking laptop from sleep
-# gives Bluetooth time to initialize and find the phone (seconds)
-WAKE_GRACE_PERIOD=15
+# 8s gives bluetooth time to initialize and find the phone (seconds)
+WAKE_GRACE_PERIOD=8
 
 # custom lock command (leave empty for automatic detection)
 # the auto-detection tries: loginctl → gnome-screensaver → xdg-screensaver

@@ -20,7 +20,7 @@ dynamic-lock uses physical proximity instead of idle time. your phone is your ke
 
 ## how it works
 
-1. a lightweight background service polls `bluetoothctl info` every second to check if your phone is connected
+1. a lightweight background service queries BlueZ via D-Bus every second to check if your phone is connected
 2. if the phone disconnects for 3 consecutive checks (~3 seconds), the screen locks
 3. once locked, the script scans for your phone and auto-reconnects when it comes back
 4. uses exponential backoff (45s → 90s → 3min → 5min) to save battery if you're genuinely away
@@ -118,7 +118,8 @@ RECONNECT_INTERVAL=45
 GRACE_PERIOD=10
 
 # wake grace period — prevents instant lock right after waking laptop (seconds)
-WAKE_GRACE_PERIOD=15
+# 8s gives bluetooth time to re-init without delaying legitimate locks too long
+WAKE_GRACE_PERIOD=8
 
 # custom lock command (leave empty for auto-detection)
 # LOCK_CMD="swaylock -f"            # sway
@@ -141,7 +142,7 @@ restart after changes: `systemctl --user restart dynamic_lock`
 
 **vs GNOME/KDE idle lock** — those lock on idle time. this locks on physical proximity. you can watch a 2-hour movie and it still works. step away for 5 seconds and it locks — no waiting for an idle timeout.
 
-**vs other bluetooth lock scripts** — most use `l2ping` which needs root, actively pings your phone (drains its battery), and takes 3-5 seconds per check. this uses `bluetoothctl info` — passive, instant, unprivileged. plus, most scripts don't auto-reconnect or handle suspend/resume properly.
+**vs other bluetooth lock scripts** — most use `l2ping` which needs root, actively pings your phone (drains its battery), and takes 3-5 seconds per check. this uses D-Bus to query BlueZ directly — passive, instant, no root, zero forks. plus, most scripts don't auto-reconnect or handle suspend/resume properly.
 
 **vs windows dynamic lock** — windows takes ~30 seconds to lock after disconnect. this does it in ~3 seconds (configurable). and the auto-reconnect actually works — windows often requires manual re-pairing.
 

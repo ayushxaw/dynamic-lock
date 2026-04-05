@@ -19,7 +19,7 @@
 # logs:    journalctl -t dynamic_lock -f
 #
 
-VERSION="5.1.0"
+VERSION="5.2.0"
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 
@@ -37,12 +37,18 @@ show_version() {
 
 show_status() {
     local state_file="/tmp/dynamic_lock_state_$UID"
-    local pid
+    local lock_file="/tmp/dynamic_lock_$UID.lock"
+    local pid=""
 
-    pid=$(pgrep -xf "/bin/bash.*dynamic_lock.sh\$" 2>/dev/null \
-          | grep -vE "^($$|$PPID)$" | head -1)
+    # prefer reading PID from lock file (reliable, no pgrep false-match)
+    [[ -f "$lock_file" ]] && read -r pid < "$lock_file" 2>/dev/null
+    # fall back to pgrep if lock file missing or stale
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        pid=$(pgrep -xf "/bin/bash.*dynamic_lock.sh\$" 2>/dev/null \
+              | grep -vE "^($$|$PPID)$" | head -1)
+    fi
 
-    if [[ -z "$pid" ]]; then
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
         echo "● dynamic_lock is not running"
         exit 1
     fi
@@ -140,21 +146,29 @@ RECONNECT_INTERVAL=45
 MAX_RECONNECT_INTERVAL=300
 LOCK_CMD=""
 GRACE_PERIOD=10
-WAKE_GRACE_PERIOD=15
+WAKE_GRACE_PERIOD=8   # 8s: enough for BT to init after wake, short enough to not delay locks
 
 _load_config() {
     local key val line
     while IFS= read -r line; do
-        # strip comments and whitespace
-        line="${line%%#*}"
-        line="${line#"${line%%[![:space:]]*}"}"
-        [[ -z "$line" ]] && continue
+        # skip blank lines and full-line comments
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" != *=* ]] && continue
+        # split on first = only
         key="${line%%=*}"
         val="${line#*=}"
-        # strip surrounding quotes from value
-        val="${val#\"}" ; val="${val%\"}"
-        val="${val#\'}" ; val="${val%\'}"
+        # trim whitespace from key
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"  
+        # trim leading/trailing whitespace from val
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"  
+        # strip surrounding quotes from val (preserves # inside quoted values
+        # e.g. LOCK_CMD="i3lock -c #000000" correctly keeps #000000)
+        if [[ "$val" == '"'*'"' ]] || [[ "$val" == "'"*"'" ]]; then
+            val="${val:1:${#val}-2}"
+        fi
         # only accept known keys (prevents arbitrary variable injection)
         case "$key" in
             PHONE_MAC|POLL_INTERVAL|MISS_THRESHOLD|NOTIFY|AUTO_RECONNECT|\
@@ -253,6 +267,8 @@ _DBUS_DEV_PATH=""
 _DBUS_ADAPTER_PATH=""
 _ADAPTER_CHECK_CTR=0
 _ADAPTER_CHECK_EVERY=30
+_ADAPTER_DOWN_CTR=0       # throttle D-Bus calls when adapter is known down
+_ADAPTER_DOWN_MAX=10      # check at most every 10s when adapter is down
 
 # auto-detect BT adapter path from D-Bus object tree
 _detect_adapter() {
@@ -290,9 +306,22 @@ init_bluetooth() {
 poll_bluetooth() {
     BT_CONNECTED=0
 
-    # throttle adapter check — check every 30 ticks or when known down
-    (( _ADAPTER_CHECK_CTR++ )) || true   # || true prevents set -e exit when result=0
-    if [[ $_ADAPTER_CHECK_CTR -ge $_ADAPTER_CHECK_EVERY ]] || [[ ${BT_ADAPTER_UP:-0} -eq 0 ]]; then
+    # throttle adapter check:
+    #   - when UP: only check every 30 ticks (saves forks)
+    #   - when DOWN: throttle to every 10 ticks (avoids D-Bus spam every second)
+    (( _ADAPTER_CHECK_CTR++ )) || true
+    local _do_adapter_check=0
+    if [[ $_ADAPTER_CHECK_CTR -ge $_ADAPTER_CHECK_EVERY ]]; then
+        _do_adapter_check=1
+    elif [[ ${BT_ADAPTER_UP:-0} -eq 0 ]]; then
+        (( _ADAPTER_DOWN_CTR++ )) || true
+        if [[ $_ADAPTER_DOWN_CTR -ge $_ADAPTER_DOWN_MAX ]]; then
+            _ADAPTER_DOWN_CTR=0
+            _do_adapter_check=1
+        fi
+    fi
+
+    if [[ $_do_adapter_check -eq 1 ]]; then
         _ADAPTER_CHECK_CTR=0
         BT_ADAPTER_UP=0
 
@@ -300,7 +329,17 @@ poll_bluetooth() {
             local out
             out=$(dbus-send --system --dest=org.bluez --print-reply \
                 "$_DBUS_ADAPTER_PATH" org.freedesktop.DBus.Properties.Get \
-                string:"org.bluez.Adapter1" string:"Powered" 2>/dev/null) || return
+                string:"org.bluez.Adapter1" string:"Powered" 2>/dev/null)
+            if [[ $? -ne 0 ]]; then
+                # D-Bus failed — bluetoothd may have restarted, re-detect adapter
+                if _detect_adapter; then
+                    log "re-detected adapter: $_DBUS_ADAPTER_PATH"
+                else
+                    _USE_DBUS=0
+                    log "D-Bus unavailable, switched to bluetoothctl"
+                fi
+                return
+            fi
             [[ "$out" == *"boolean true"* ]] && BT_ADAPTER_UP=1
         else
             local out
@@ -401,10 +440,21 @@ lock_session() {
         log "custom LOCK_CMD failed, trying fallbacks"
     fi
 
-    # loginctl (most systemd distros)
+    # loginctl — prefer graphical (x11/wayland) sessions over TTY sessions
     local session
-    session=$(loginctl show-user "$USER" --property=Sessions --value 2>/dev/null \
-              | tr ' ' '\n' | grep -m1 '[0-9]')
+    local all_sessions
+    all_sessions=$(loginctl show-user "$USER" --property=Sessions --value 2>/dev/null \
+                   | tr ' ' '\n' | grep -E '^[0-9]+$')
+    # try to find a graphical session first
+    while IFS= read -r session; do
+        local stype
+        stype=$(loginctl show-session "$session" --property=Type --value 2>/dev/null)
+        if [[ "$stype" == "x11" || "$stype" == "wayland" || "$stype" == "mir" ]]; then
+            loginctl lock-session "$session" && return
+        fi
+    done <<< "$all_sessions"
+    # fall back to any session
+    session=$(echo "$all_sessions" | head -1)
     [[ -n "$session" ]] && loginctl lock-session "$session" && return
 
     # GNOME dbus
@@ -513,7 +563,13 @@ while [[ $RUNNING -eq 1 ]]; do
     # ── connection logic ──────────────────────────────────────────────────
     if [[ $BT_CONNECTED -eq 1 ]]; then
         [[ $SEEN -eq 0 ]] && { log "phone detected"; notify "Dynamic Lock Armed" "dialog-information" "Monitoring phone"; }
-        [[ $LOCKED -eq 1 ]] && { log "phone returned, re-armed"; notify "Dynamic Lock Re-armed" "dialog-information" "Phone reconnected"; }
+        if [[ $LOCKED -eq 1 ]]; then
+            log "phone returned, re-armed"
+            notify "Dynamic Lock Re-armed" "dialog-information" "Phone reconnected"
+            # set grace period even on natural reconnect (phone may be briefly flaky)
+            read_uptime
+            GRACE_UNTIL=$(( _UPTIME + GRACE_PERIOD ))
+        fi
         SEEN=1; MISS=0; LOCKED=0
         RECONNECT_FAILURES=0
 
@@ -572,4 +628,6 @@ while [[ $RUNNING -eq 1 ]]; do
     fi
 done
 
+# note: cleanup() calls exit 0 on SIGTERM/SIGINT so this line is only
+# reached if the while loop exits naturally (RUNNING set to 0 by future code)
 log "stopped"
