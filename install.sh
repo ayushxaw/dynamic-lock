@@ -214,6 +214,7 @@ if [[ -f "$HOME/.config/dynamic_lock/config" ]]; then
         echo "PHONE_MAC=\"$PHONE_MAC\"" >> "$HOME/.config/dynamic_lock/config"
     fi
     ok "updated PHONE_MAC in existing config"
+    chmod 600 "$HOME/.config/dynamic_lock/config" 2>/dev/null || true
 else
     cat > "$HOME/.config/dynamic_lock/config" <<EOF
 # ─────────────────────────────────────────────────────────────────
@@ -251,6 +252,8 @@ WAKE_GRACE_PERIOD=8
 LOCK_CMD="${_SUGGESTED_LOCK}"
 EOF
     ok "config written to ~/.config/dynamic_lock/config"
+    chmod 600 "$HOME/.config/dynamic_lock/config"   # private — contains device MAC
+    ok "config permissions set to 600 (private)"
     if [[ -n "$_SUGGESTED_LOCK" ]]; then
         ok "auto-detected lock command for ${_DE}: ${B}${_SUGGESTED_LOCK}${N}"
     fi

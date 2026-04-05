@@ -19,7 +19,7 @@
 # logs:    journalctl -t dynamic_lock -f
 #
 
-VERSION="5.2.0"
+VERSION="5.3.0"
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 
@@ -270,14 +270,19 @@ _ADAPTER_CHECK_EVERY=30
 _ADAPTER_DOWN_CTR=0       # throttle D-Bus calls when adapter is known down
 _ADAPTER_DOWN_MAX=10      # check at most every 10s when adapter is down
 
-# auto-detect BT adapter path from D-Bus object tree
+# auto-detect BT adapter path from D-Bus object tree (pure bash — no echo|grep subshell)
 _detect_adapter() {
     local objects
     objects=$(dbus-send --system --dest=org.bluez --print-reply \
         / org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null) || return 1
-    # find first hci path
-    local adapter
-    adapter=$(echo "$objects" | grep -o '/org/bluez/hci[0-9]*"' | head -1 | tr -d '"')
+    # extract first /org/bluez/hciN path using bash pattern matching (no grep fork)
+    local _work="$objects"
+    local adapter=""
+    while [[ "$_work" == */org/bluez/hci* ]]; do
+        _work="${_work#*/org/bluez/hci}"
+        local idx="${_work%%[^0-9]*}"
+        [[ -n "$idx" ]] && adapter="/org/bluez/hci${idx}" && break
+    done
     [[ -n "$adapter" ]] || return 1
     _DBUS_ADAPTER_PATH="$adapter"
     _DBUS_DEV_PATH="${adapter}/dev_${PHONE_MAC//:/_}"
@@ -424,6 +429,9 @@ try_reconnect() {
         log "phone connected briefly but dropped"
     fi
 
+    # reset adapter-down throttle counter — adapter is confirmed UP after reconnect
+    _ADAPTER_DOWN_CTR=0
+
     log "reconnect failed"
     return 1
 }
@@ -457,9 +465,14 @@ lock_session() {
     session=$(echo "$all_sessions" | head -1)
     [[ -n "$session" ]] && loginctl lock-session "$session" && return
 
-    # GNOME dbus
-    dbus-send --session --dest=org.gnome.ScreenSaver --type=method_call \
-        /org/gnome/ScreenSaver org.gnome.ScreenSaver.Lock &>/dev/null && return
+    # KDE / generic freedesktop screensaver (works on KDE Plasma, XFCE, etc.)
+    if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        dbus-send --session --dest=org.freedesktop.ScreenSaver --type=method_call \
+            /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver.Lock &>/dev/null && return
+        # GNOME dbus (GNOME-specific fallback)
+        dbus-send --session --dest=org.gnome.ScreenSaver --type=method_call \
+            /org/gnome/ScreenSaver org.gnome.ScreenSaver.Lock &>/dev/null && return
+    fi
 
     # gnome-screensaver-command
     command -v gnome-screensaver-command &>/dev/null \
@@ -479,7 +492,8 @@ _FIRST_TICK=1
 
 handle_wake() {
     read_uptime
-    local delta=$(( _UPTIME - _LAST_UPTIME ))
+    local delta normal_max  # declare separately to preserve exit codes
+    delta=$(( _UPTIME - _LAST_UPTIME ))
     _LAST_UPTIME=$_UPTIME
 
     # first tick — nothing to compare
@@ -488,15 +502,16 @@ handle_wake() {
         return
     fi
 
-    local normal_max=$(( POLL_INTERVAL + 15 ))
+    normal_max=$(( POLL_INTERVAL + 15 ))
     [[ $delta -lt $normal_max && $delta -ge 0 ]] && return
 
     # resumed from suspend
     log "resume detected (${delta}s gap)"
     MISS=0; save_state
     RECONNECT_FAILURES=0; LAST_RECONNECT_TIME=0
-    # re-detect adapter (it may have changed index after re-init)
+    # reset both adapter throttle counters so adapter is checked immediately after wake
     _ADAPTER_CHECK_CTR=$_ADAPTER_CHECK_EVERY
+    _ADAPTER_DOWN_CTR=$_ADAPTER_DOWN_MAX  # force immediate check even if was down
     # grace period so BT hardware has time to re-init before counting misses
     GRACE_UNTIL=$(( _UPTIME + WAKE_GRACE_PERIOD ))
 }
