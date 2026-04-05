@@ -94,6 +94,7 @@ cleanup() {
     fi
     kill %% 2>/dev/null
     rm -f "$LOCK_FILE" 2>/dev/null
+    # intentionally keep STATE_FILE — --status reads it after exit
     exit 0
 }
 trap cleanup SIGTERM SIGINT SIGHUP
@@ -380,6 +381,9 @@ PREV_LOCKED=$LOCKED
 LAST_RECONNECT_TIME=0
 RECONNECT_FAILURES=0
 GRACE_UNTIL=0
+
+# write initial state immediately so --status always has a file to read
+save_state
 
 while [[ $RUNNING -eq 1 ]]; do
 
