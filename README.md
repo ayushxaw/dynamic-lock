@@ -75,14 +75,14 @@ exit
 # check if it's running and what state it's in
 dynamic_lock.sh --status
 
-# watch live activity
-journalctl -t dynamic_lock -f
+# watch live logs
+dynamic_lock.sh --logs
 
-# pause temporarily (e.g. phone in another room but you don't want to lock)
-touch ~/.dynamic_lock_pause
+# pause temporarily (e.g. phone in another room)
+dynamic_lock.sh --pause
 
-# resume
-rm ~/.dynamic_lock_pause
+# resume monitoring
+dynamic_lock.sh --resume
 
 # restart after config changes
 systemctl --user restart dynamic_lock
@@ -155,7 +155,7 @@ restart after changes: `systemctl --user restart dynamic_lock`
 - **audio safe** — preserves audio output during reconnect (prevents pipewire from routing to phone)
 - **bluetooth safe** — checks adapter power state before counting misses (no false locks during bluetoothd restart)
 - **multi-DE support** — lock falls through loginctl → gnome-screensaver → xdg-screensaver
-- **pauseable** — `touch ~/.dynamic_lock_pause` to temporarily disable
+- **pauseable** — `dynamic_lock.sh --pause` / `--resume` to temporarily disable
 - **no root needed** — runs as a regular user service
 
 ## architecture
@@ -211,8 +211,12 @@ restart after changes: `systemctl --user restart dynamic_lock`
 - check `AUTO_RECONNECT=1` in config
 - check logs: `journalctl -t dynamic_lock -f` and look for "scanning" / "reconnect" entries
 
+**"screen locks right when i open my laptop"**
+- this is a known edge case on slow BT hardware — increase `WAKE_GRACE_PERIOD` in config (default is 15 seconds)
+- the grace period gives bluetooth time to reconnect after waking from sleep before counting misses
+
 **"it takes forever to shut down"**
-- shouldn't happen with v4+ (exits in milliseconds). check version: `dynamic_lock.sh --version`
+- shouldn't happen with v5+ (exits in milliseconds). check version: `dynamic_lock.sh --version`
 - if stuck, check: `systemctl --user status dynamic_lock`
 
 ## battery impact

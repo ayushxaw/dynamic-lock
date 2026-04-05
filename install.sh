@@ -149,7 +149,7 @@ for dev in "${DEVICES[@]}"; do
     else
         echo -e "  ${D}$i)${N} $name ${D}[$mac]${N}${connected}"
     fi
-    (( i++ ))
+    i=$(( i + 1 ))
 done
 
 echo ""
@@ -306,9 +306,9 @@ echo ""
 echo -e "  ${B}quick reference:${N}"
 echo ""
 echo "  status     │ dynamic_lock.sh --status"
-echo "  logs       │ journalctl -t dynamic_lock -f"
-echo "  pause      │ touch ~/.dynamic_lock_pause"
-echo "  resume     │ rm ~/.dynamic_lock_pause"
+echo "  logs       │ dynamic_lock.sh --logs"
+echo "  pause      │ dynamic_lock.sh --pause"
+echo "  resume     │ dynamic_lock.sh --resume"
 echo "  restart    │ systemctl --user restart dynamic_lock"
 echo "  uninstall  │ bash uninstall.sh"
 echo ""
