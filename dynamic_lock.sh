@@ -19,7 +19,7 @@
 # logs:    journalctl -t dynamic_lock -f
 #
 
-VERSION="5.3.0"
+VERSION="5.4.0"
 
 # ── CLI flags ─────────────────────────────────────────────────────────────────
 
@@ -221,7 +221,9 @@ fi
 
 notify() {
     [[ "$NOTIFY" -eq 1 ]] || return
-    timeout 2 notify-send -a "Dynamic Lock" -i "$2" "$1" "$3" 2>/dev/null || true
+    local urgency="$4"
+    [[ -z "$urgency" ]] && urgency="normal"
+    timeout 2 notify-send -a "Dynamic Lock" -u "$urgency" -i "$2" "$1" "$3" 2>/dev/null || true
 }
 
 # atomic state save — write to tmp then rename to avoid partial reads in --status
@@ -237,7 +239,9 @@ load_state() {
         read -r s l m < "$STATE_FILE" 2>/dev/null || return
         [[ "$s" =~ ^[01]$ ]]   && SEEN=$s
         [[ "$l" =~ ^[01]$ ]]   && LOCKED=$l
-        [[ "$m" =~ ^[0-9]+$ ]] && MISS=$m
+        # intentionally NOT restoring MISS from state:
+        # if service restarts, MISS resets to 0 to avoid premature locks
+        # (a partial miss-count before restart shouldn't persist)
     fi
 }
 
@@ -395,8 +399,11 @@ try_reconnect() {
     command -v pactl &>/dev/null && prev_sink=$(pactl get-default-sink 2>/dev/null)
 
     # scan + connect in a killable subshell
+    # explicitly stop scan after attempt — prevents adapter staying in scan mode
+    # (bluetoothctl timeout kills the process but BlueZ keeps scanning internally)
     (
         timeout 6 bluetoothctl --timeout 5 scan on &>/dev/null
+        bluetoothctl scan off &>/dev/null
         sleep 1
         timeout 10 bluetoothctl connect "$PHONE_MAC" &>/dev/null
     ) &
@@ -440,7 +447,7 @@ try_reconnect() {
 
 lock_session() {
     log "locking session"
-    notify "Screen Locked" "dialog-password" "Phone disconnected"
+    notify "Screen Locked" "dialog-password" "Phone disconnected" "critical"
 
     # custom lock command from config
     if [[ -n "$LOCK_CMD" ]]; then
@@ -553,14 +560,14 @@ while [[ $RUNNING -eq 1 ]]; do
     if [[ -f "$PAUSE_FILE" ]]; then
         if [[ "$_PAUSED" -eq 0 ]]; then
             log "paused"
-            notify "Dynamic Lock Paused" "dialog-information" "Run --resume to re-arm"
+            notify "Dynamic Lock Paused" "dialog-information" "Run --resume to re-arm" "normal"
             _PAUSED=1
         fi
         continue
     fi
     if [[ "$_PAUSED" -eq 1 ]]; then
         log "resumed"
-        notify "Dynamic Lock Active" "dialog-information" "Monitoring phone"
+        notify "Dynamic Lock Active" "dialog-information" "Monitoring phone" "normal"
         _PAUSED=0; MISS=0
     fi
 
@@ -577,10 +584,10 @@ while [[ $RUNNING -eq 1 ]]; do
 
     # ── connection logic ──────────────────────────────────────────────────
     if [[ $BT_CONNECTED -eq 1 ]]; then
-        [[ $SEEN -eq 0 ]] && { log "phone detected"; notify "Dynamic Lock Armed" "dialog-information" "Monitoring phone"; }
+        [[ $SEEN -eq 0 ]] && { log "phone detected"; notify "Dynamic Lock Armed" "dialog-information" "Monitoring phone" "normal"; }
         if [[ $LOCKED -eq 1 ]]; then
             log "phone returned, re-armed"
-            notify "Dynamic Lock Re-armed" "dialog-information" "Phone reconnected"
+            notify "Dynamic Lock Re-armed" "dialog-information" "Phone reconnected" "normal"
             # set grace period even on natural reconnect (phone may be briefly flaky)
             read_uptime
             GRACE_UNTIL=$(( _UPTIME + GRACE_PERIOD ))
@@ -610,7 +617,7 @@ while [[ $RUNNING -eq 1 ]]; do
             if [[ $_elapsed -ge $_BACKOFF ]]; then
                 LAST_RECONNECT_TIME=$_UPTIME
                 if try_reconnect; then
-                    notify "Reconnected" "dialog-information" "Auto-reconnect succeeded"
+                    notify "Reconnected" "dialog-information" "Auto-reconnect succeeded" "normal"
                     SEEN=1; MISS=0; LOCKED=0
                     RECONNECT_FAILURES=0
                     read_uptime

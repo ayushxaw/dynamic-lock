@@ -138,11 +138,15 @@ fi
 
 i=1
 for dev in "${DEVICES[@]}"; do
-    mac=$(echo "$dev" | awk '{print $2}')
-    name=$(echo "$dev" | cut -d' ' -f3-)
-    icon=$(bluetoothctl info "$mac" 2>/dev/null | grep "Icon:" | awk '{print $2}')
+    mac="${dev#* }"           # skip 'Device ' prefix
+    mac="${mac%% *}"            # take first word = MAC
+    name="${dev#* }"            # skip 'Device '
+    name="${name#* }"           # skip MAC
+    btinfo=$(bluetoothctl info "$mac" 2>/dev/null)
+    icon=""
+    [[ "$btinfo" == *"Icon: "* ]] && { icon="${btinfo#*Icon: }"; icon="${icon%%$'\n'*}"; icon="${icon%% *}"; }
     connected=""
-    bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes" && connected=" ${G}●${N}"
+    [[ "$btinfo" == *"Connected: yes"* ]] && connected=" ${G}●${N}"
 
     if [[ "$icon" == "phone" ]]; then
         echo -e "  ${G}${B}$i)${N} $name ${D}[$mac]${N} 📱${connected}"
@@ -155,8 +159,9 @@ done
 echo ""
 
 if [[ ${#DEVICES[@]} -eq 1 ]]; then
-    PHONE_MAC=$(echo "${DEVICES[0]}" | awk '{print $2}')
-    PHONE_NAME=$(echo "${DEVICES[0]}" | cut -d' ' -f3-)
+    _d0="${DEVICES[0]#* }"     # strip 'Device '
+    PHONE_MAC="${_d0%% *}"      # first word = MAC
+    PHONE_NAME="${_d0#* }"      # rest = name
     echo -e "  only one device found: ${B}$PHONE_NAME${N}"
     read -rp "  use this device? (Y/n): " confirm
     [[ "$confirm" == "n" || "$confirm" == "N" ]] && { echo "  cancelled."; exit 0; }
@@ -164,8 +169,9 @@ else
     read -rp "  enter the number of your phone (or a MAC address): " choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#DEVICES[@]} ]]; then
-        PHONE_MAC=$(echo "${DEVICES[$((choice-1))]}" | awk '{print $2}')
-        PHONE_NAME=$(echo "${DEVICES[$((choice-1))]}" | cut -d' ' -f3-)
+        _dn="${DEVICES[$((choice-1))]#* }"  # strip 'Device '
+        PHONE_MAC="${_dn%% *}"               # first word = MAC
+        PHONE_NAME="${_dn#* }"               # rest = name
     elif [[ "$choice" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
         PHONE_MAC="$choice"
         PHONE_NAME=$(bluetoothctl info "$PHONE_MAC" 2>/dev/null | grep "Name:" | sed 's/.*Name: //' || echo "Unknown")
