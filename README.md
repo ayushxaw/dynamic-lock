@@ -1,15 +1,15 @@
 # 🔒 dynamic-lock
 
-windows-style dynamic lock for linux — automatically locks your screen when your phone's bluetooth disconnects.
+windows-style dynamic lock for linux — automatically locks your screen when your phone leaves KDE Connect range.
 
-walk away from your laptop with your phone in your pocket → screen locks in 3 seconds. come back → auto-reconnects and re-arms. no idle timers, no manual locking.
+walk away from your laptop with your phone in your pocket → screen locks in ~30 seconds. come back → re-arms automatically. no idle timers, no manual locking.
 
 ```
-phone connected ──→ phone leaves ──→ 3 seconds ──→ 🔒 screen locks
-                                                         │
-                   phone returns ←── auto-reconnect ←────┘
-                        │
-                   re-armed (next disconnect locks again)
+phone reachable ──→ phone leaves ──→ ~30 seconds ──→ 🔒 screen locks
+                                                          │
+                    phone returns ←── auto re-arm ←───────┘
+                         │
+                    armed (next disconnect locks again)
 ```
 
 ## why this exists
@@ -20,230 +20,99 @@ dynamic-lock uses physical proximity instead of idle time. your phone is your ke
 
 ## how it works
 
-1. a lightweight background service queries BlueZ via D-Bus every second to check if your phone is connected
-2. if the phone disconnects for 3 consecutive checks (~3 seconds), the screen locks
-3. once locked, the script scans for your phone and auto-reconnects when it comes back
-4. uses exponential backoff (45s → 90s → 3min → 5min) to save battery if you're genuinely away
+1. a lightweight background service polls KDE Connect every 10 seconds to check if your phone is reachable
+2. if the phone is unreachable for 3 consecutive checks (~30 seconds), the screen locks
+3. once locked, the script waits for the phone to return and automatically re-arms
+4. uses grace periods after wake from suspend (15s) and after reconnect (20s) to avoid false locks
 
-no root needed. no pinging. no active scanning during normal monitoring. battery impact is completely negligible.
+no root needed. battery impact is negligible (~1.3MB RAM, <1% CPU).
+
+## requirements
+
+- **linux** with GNOME, KDE, or any desktop with `loginctl`
+- **KDE Connect** installed (`sudo apt install kdeconnect` / `sudo pacman -S kdeconnect`)
+- **KDE Connect app** on your phone ([Google Play](https://play.google.com/store/apps/details?id=org.kde.kdeconnect_tp) / [F-Droid](https://f-droid.org/packages/org.kde.kdeconnect_tp/))
+- phone and laptop on the same network (WiFi)
 
 ## quick start
 
 ```bash
-# one-liner (clone + install)
-git clone https://github.com/ayushxaw/dynamic-lock.git && cd dynamic-lock && bash install.sh
-```
-
-or step by step:
-
-```bash
 git clone https://github.com/ayushxaw/dynamic-lock.git
 cd dynamic-lock
-bash install.sh
+chmod +x install.sh
+./install.sh
 ```
 
-the installer will:
-- check that bluetooth is set up
-- show your paired devices and let you pick your phone
-- install the script and start monitoring
-
-that's it. walk away and test it.
-
-### prerequisites
-
-- linux with systemd (ubuntu, fedora, arch, etc.)
-- bluetooth (`bluez` package)
-- a phone paired via bluetooth
-
-if your phone isn't paired yet:
-
-```bash
-bluetoothctl
-# inside bluetoothctl:
-scan on
-# wait for your phone to appear, then:
-pair AA:BB:CC:DD:EE:FF
-trust AA:BB:CC:DD:EE:FF
-exit
-```
-
-> **important:** on your phone's bluetooth settings, make sure **"Phone calls"** is enabled for this laptop's connection. this keeps the bluetooth link alive.
-
-## usage
-
-```bash
-# check if it's running and what state it's in
-dynamic_lock.sh --status
-
-# watch live logs
-dynamic_lock.sh --logs
-
-# pause temporarily (e.g. phone in another room)
-dynamic_lock.sh --pause
-
-# resume monitoring
-dynamic_lock.sh --resume
-
-# restart after config changes
-systemctl --user restart dynamic_lock
-
-# stop completely
-systemctl --user stop dynamic_lock
-```
+that's it. the daemon starts immediately and auto-starts on login.
 
 ## configuration
 
 edit `~/.config/dynamic_lock/config`:
 
 ```bash
-# your phone's bluetooth MAC (required)
-PHONE_MAC="AA:BB:CC:DD:EE:FF"
+# device ID — leave blank to auto-detect from paired devices
+DEVICE_ID=
 
-# seconds between connection checks (default: 1)
-POLL_INTERVAL=1
+# seconds between reachability polls (2–300)
+POLL_INTERVAL=10
 
-# consecutive misses before locking (default: 3)
+# consecutive misses before locking (1–60)
 MISS_THRESHOLD=3
 
-# desktop notifications (1 = on, 0 = off)
+# seconds to skip miss counting after phone reconnects (0–600)
+GRACE_PERIOD=20
+
+# seconds to skip miss counting after waking from suspend (0–600)
+WAKE_GRACE_PERIOD=15
+
+# desktop notifications: 1=enabled, 0=disabled
 NOTIFY=1
 
-# auto-reconnect when phone returns (1 = on, 0 = off)
-AUTO_RECONNECT=1
-
-# initial reconnect interval in seconds (backs off automatically)
-RECONNECT_INTERVAL=45
-
-# grace period after reconnect — prevents rapid re-lock (seconds)
-GRACE_PERIOD=10
-
-# wake grace period — prevents instant lock right after waking laptop (seconds)
-# 8s gives bluetooth time to re-init without delaying legitimate locks too long
-WAKE_GRACE_PERIOD=8
-
-# custom lock command (leave empty for auto-detection)
-# LOCK_CMD="swaylock -f"            # sway
-# LOCK_CMD="i3lock -c 000000"       # i3
-# LOCK_CMD="loginctl lock-session"  # generic
-LOCK_CMD=""
+# override lock command (leave blank for automatic fallback chain)
+# LOCK_CMD=loginctl lock-session
 ```
 
-restart after changes: `systemctl --user restart dynamic_lock`
+## usage
 
-### lock speed tuning
+```bash
+dynamic_lock.sh --status    # show daemon state
+dynamic_lock.sh --pause     # pause monitoring (e.g., phone charging elsewhere)
+dynamic_lock.sh --resume    # resume monitoring
+dynamic_lock.sh --logs      # view recent logs
+dynamic_lock.sh --version   # print version
+```
 
-| POLL_INTERVAL | MISS_THRESHOLD | lock delay | battery |
-|:---:|:---:|:---:|:---:|
-| 1 | 3 | ~3s | lowest impact |
-| 3 | 3 | ~9s | slightly less |
-| 10 | 3 | ~30s (like windows) | negligible |
+## lock method fallback chain
 
-## how is this different from...
+when your phone disappears, dynamic-lock tries these methods in order:
 
-**vs GNOME/KDE idle lock** — those lock on idle time. this locks on physical proximity. you can watch a 2-hour movie and it still works. step away for 5 seconds and it locks — no waiting for an idle timeout.
+1. `loginctl lock-session` (prefers graphical x11/wayland sessions)
+2. D-Bus `org.freedesktop.ScreenSaver.Lock`
+3. D-Bus `org.gnome.ScreenSaver.Lock`
+4. `gnome-screensaver-command --lock`
+5. `xdg-screensaver lock`
 
-**vs other bluetooth lock scripts** — most use `l2ping` which needs root, actively pings your phone (drains its battery), and takes 3-5 seconds per check. this uses D-Bus to query BlueZ directly — passive, instant, no root, zero forks. plus, most scripts don't auto-reconnect or handle suspend/resume properly.
-
-**vs windows dynamic lock** — windows takes ~30 seconds to lock after disconnect. this does it in ~3 seconds (configurable). and the auto-reconnect actually works — windows often requires manual re-pairing.
+or set `LOCK_CMD` in config to use your own (e.g., `i3lock`, `swaylock`).
 
 ## features
 
-- **instant lock** — 3 seconds from disconnect to locked screen
-- **auto-reconnect** — scans and reconnects when phone returns (scan → connect sequence that works with android)
-- **instant shutdown** — signal trap + interruptible sleep, exits in milliseconds (no 90s systemd timeout)
-- **suspend-safe** — detects resume and resets state so bluetooth can re-initialize
-- **battery aware** — exponential backoff on reconnect (45s → 90s → 180s → 5min cap)
-- **audio safe** — preserves audio output during reconnect (prevents pipewire from routing to phone)
-- **bluetooth safe** — checks adapter power state before counting misses (no false locks during bluetoothd restart)
-- **multi-DE support** — lock falls through loginctl → gnome-screensaver → xdg-screensaver
-- **pauseable** — `dynamic_lock.sh --pause` / `--resume` to temporarily disable
-- **no root needed** — runs as a regular user service
-
-## architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ systemd user service                                    │
-│                                                         │
-│  ┌───────────┐     ┌──────────┐     ┌───────────────┐  │
-│  │  poll      │────→│ connected│────→│ SEEN=1        │  │
-│  │  every 1s  │     │  ?       │     │ reset misses  │  │
-│  │            │     └────┬─────┘     └───────────────┘  │
-│  │            │          │ no                            │
-│  │            │     ┌────▼─────┐                        │
-│  │            │     │ MISS++   │                        │
-│  │            │     │ ≥ 3?     │                        │
-│  │            │     └────┬─────┘                        │
-│  │            │          │ yes                           │
-│  │            │     ┌────▼─────┐     ┌───────────────┐  │
-│  │            │     │ LOCK     │────→│ LOCKED=1      │  │
-│  │            │     │ screen   │     │ poll every 5s  │  │
-│  └───────────┘     └──────────┘     └───────┬───────┘  │
-│                                             │           │
-│                                    ┌────────▼────────┐  │
-│                                    │ try_reconnect   │  │
-│                                    │ scan → connect  │  │
-│                                    │ ↑ backoff: 45s  │  │
-│                                    │   90s, 180s, 5m │  │
-│                                    └─────────────────┘  │
-│                                                         │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │ safety checks:                                     │  │
-│  │  • bt adapter down → pause misses                  │  │
-│  │  • suspend detected → reset misses & backoff       │  │
-│  │  • SIGTERM → exit immediately (interruptible)      │  │
-│  └────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
-
-## troubleshooting
-
-**"it locked when my phone was right here"**
-- check if bluetooth briefly dropped: `journalctl -t dynamic_lock -n 50`
-- increase `MISS_THRESHOLD` to 5 in config for more tolerance
-
-**"it doesn't lock when i walk away"**
-- verify phone is paired: `bluetoothctl info YOUR_MAC`
-- check if service is running: `systemctl --user status dynamic_lock`
-- make sure "Phone calls" is enabled in phone's BT settings for this laptop
-
-**"my phone doesn't auto-reconnect"**
-- verify the phone is paired AND trusted: `bluetoothctl info YOUR_MAC | grep -E "Paired|Trusted"`
-- check `AUTO_RECONNECT=1` in config
-- check logs: `journalctl -t dynamic_lock -f` and look for "scanning" / "reconnect" entries
-
-**"screen locks right when i open my laptop"**
-- this is a known edge case on slow BT hardware — increase `WAKE_GRACE_PERIOD` in config (default is 15 seconds)
-- the grace period gives bluetooth time to reconnect after waking from sleep before counting misses
-
-**"it takes forever to shut down"**
-- shouldn't happen with v5+ (exits in milliseconds). check version: `dynamic_lock.sh --version`
-- if stuck, check: `systemctl --user status dynamic_lock`
-
-## battery impact
-
-| component | power | notes |
-|-----------|-------|-------|
-| normal monitoring | ~0.08W | polling via D-Bus directly (0 forks, 3x faster than bluetoothctl) |
-| reconnect scan | ~0.3W burst | BLE scan for ~5s, then connect |
-| total impact | **Negligible (nearly unmeasurable)** | completely negligible vs screen (~5W) and CPU (~8W) |
+- **3-state reachability check** — distinguishes "phone gone" from "kdeconnect daemon crashed" (no false locks on software issues)
+- **suspend/wake detection** — grace period after waking so KDE Connect has time to reconnect
+- **reconnect grace period** — avoids flapping when phone connection is briefly unstable
+- **safe config parser** — no `source`/`eval`, only known keys accepted
+- **single instance** via `flock` — can't accidentally run two daemons
+- **signal-based pause/resume** — `SIGUSR1` to pause, `SIGUSR2` to resume
+- **timeout on all external calls** — kdeconnect-cli and notify-send can't hang the daemon
+- **integer validation** — non-numeric config values fall back to defaults instead of crashing
+- **lock failure backoff** — if lock command fails, backs off exponentially (30s → 300s)
+- **atomic state file** — write+rename for `--status` reads
+- **systemd hardening** — `ProtectSystem`, `ProtectHome`, `MemoryMax`, `CPUQuota`
 
 ## uninstall
 
 ```bash
-bash uninstall.sh
+./uninstall.sh
 ```
-
-removes the script, service, and temp files. config is preserved at `~/.config/dynamic_lock/` in case you want to reinstall later.
-
-## supported
-
-tested on ubuntu 22.04+ and fedora 39+ with GNOME (wayland). should work on any linux with:
-- systemd
-- bluez (bluetooth)
-- a desktop environment with a lock screen
-
-lock command falls through: `loginctl` → `gnome-screensaver` → `xdg-screensaver`.
 
 ## license
 

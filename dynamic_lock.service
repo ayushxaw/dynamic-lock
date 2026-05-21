@@ -1,41 +1,66 @@
-# dynamic_lock.service — systemd user service for bluetooth proximity lock
+# ============================================================================
+# dynamic_lock.service — systemd user unit for Dynamic Lock
+# ============================================================================
 #
-# installed by install.sh to ~/.config/systemd/user/
-# manage with:
-#   systemctl --user status dynamic_lock
-#   systemctl --user restart dynamic_lock
-#   systemctl --user stop dynamic_lock
+# INSTALLATION:
+#   1. Copy the script:
+#        sudo install -m 755 dynamic_lock.sh %h/.local/bin/dynamic_lock.sh
+#
+#   2. Install this unit file:
+#        mkdir -p ~/.config/systemd/user
+#        cp dynamic_lock.service ~/.config/systemd/user/
+#        systemctl --user daemon-reload
+#
+#   3. Enable & start:
+#        systemctl --user enable --now dynamic_lock.service
+#
+# ============================================================================
 
 [Unit]
-Description=Bluetooth Dynamic Lock
-After=bluetooth.target graphical-session.target
-Wants=bluetooth.target graphical-session.target
+Description=Dynamic Lock — auto-lock when phone leaves range
+# KDE Connect runs as a D-Bus activated service, not a systemd unit,
+# so we only depend on graphical-session.target (no After=kdeconnectd.service).
+# No ConditionEnvironment — the target dependency handles session gating.
+After=graphical-session.target
+Wants=graphical-session.target
 StartLimitIntervalSec=120
 StartLimitBurst=4
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p %h/.config/dynamic_lock
 ExecStart=%h/.local/bin/dynamic_lock.sh
 
-# fast shutdown — script traps SIGTERM and exits immediately,
-# but this is a safety net in case it doesn't
-TimeoutStopSec=5
-KillSignal=SIGTERM
-
-# resource limits — safety net against bugs or runaway processes
-MemoryMax=50M
-CPUQuota=10%
-
-# dbus session address — needed for loginctl and notify-send
+# D-Bus session address — needed for loginctl, notify-send, and dbus-send
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
 
-# restart on crash, not on clean exit
+# Graceful shutdown via SIGTERM, then SIGKILL after 5s
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Restart on crash, not on clean exit
 Restart=on-failure
 RestartSec=20
 
-# logging
+# Resource limits — safety net against bugs or runaway processes
+MemoryMax=50M
+CPUQuota=10%
+
+# Logging
 StandardOutput=journal
 StandardError=journal
 
+# Hardening — ProtectSystem=full (not strict) because kdeconnect-cli
+# may need to access system paths under /usr that strict would block.
+# ProtectHome=read-only with ReadWritePaths for our config dir.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/tmp
+ReadWritePaths=%h/.config/dynamic_lock
+PrivateTmp=false
+
 [Install]
-WantedBy=default.target
+# graphical-session.target — only starts in graphical sessions,
+# not on TTY login or SSH (default.target would start everywhere)
+WantedBy=graphical-session.target
