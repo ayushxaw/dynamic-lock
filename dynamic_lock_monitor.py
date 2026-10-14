@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GNOME user monitor using GSConnect device connection state."""
+"""GNOME user monitor using paired-phone Bluetooth signal strength."""
 
 import os
 import shlex
@@ -17,9 +17,10 @@ from gi.repository import Gio, GLib, GLibUnix
 from dynamic_lock_state import PresenceMachine
 
 
-GSCONNECT = "org.gnome.Shell.Extensions.GSConnect"
-GSCONNECT_PATH = "/org/gnome/Shell/Extensions/GSConnect"
-GSCONNECT_DEVICE_IFACE = "org.gnome.Shell.Extensions.GSConnect.Device"
+BLUEZ = "org.bluez"
+BLUEZ_DEVICE_IFACE = "org.bluez.Device1"
+BLUEZ_ADAPTER_IFACE = "org.bluez.Adapter1"
+PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
 OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 MUTTER_IDLE = "org.gnome.Mutter.IdleMonitor"
 MUTTER_PATH = "/org/gnome/Mutter/IdleMonitor/Core"
@@ -37,14 +38,16 @@ def read_config(path):
         raise MonitorError(f"cannot read config {path}: {error}") from error
 
     allowed = {
-        "GSCONNECT_DEVICE_NAME",
+        "PHONE_ADDRESS",
+        "RSSI_DROP_DB",
+        "RSSI_STALE_SECONDS",
         "AWAY_CONFIRM_SECONDS",
         "RETURN_CONFIRM_SECONDS",
         "IDLE_AFTER_SECONDS",
         "POLL_SECONDS",
         "LOCK_CMD",
     }
-    legacy = {"PHONE_ADDRESS", "RSSI_DROP_DB", "RSSI_STALE_SECONDS"}
+    legacy = {"GSCONNECT_DEVICE_NAME"}
     values = {}
     for number, raw in enumerate(lines, 1):
         line = raw.strip()
@@ -56,7 +59,7 @@ def read_config(path):
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
         if key in legacy:
-            print(f"WARN: {key} is obsolete; this monitor uses GSConnect device status.", file=sys.stderr)
+            print(f"WARN: {key} is obsolete; this monitor uses Bluetooth RSSI.", file=sys.stderr)
             continue
         if key not in allowed:
             print(f"WARN: ignoring unknown config key {key}", file=sys.stderr)
@@ -66,13 +69,15 @@ def read_config(path):
         values[key] = value
 
     settings = {
+        "RSSI_DROP_DB": (10, 3, 30),
+        "RSSI_STALE_SECONDS": (15, 5, 120),
         "AWAY_CONFIRM_SECONDS": (30, 5, 300),
         "RETURN_CONFIRM_SECONDS": (5, 1, 60),
         "IDLE_AFTER_SECONDS": (1, 0, 3600),
         "POLL_SECONDS": (5, 2, 30),
     }
     config = {
-        "GSCONNECT_DEVICE_NAME": values.get("GSCONNECT_DEVICE_NAME", ""),
+        "PHONE_ADDRESS": values.get("PHONE_ADDRESS", "").upper(),
         "LOCK_CMD": values.get("LOCK_CMD", ""),
     }
     for key, (fallback, minimum, maximum) in settings.items():
@@ -86,6 +91,14 @@ def read_config(path):
             number = fallback
             print(f"WARN: {key} must be {minimum}–{maximum}; using {fallback}", file=sys.stderr)
         config[key] = number
+    address = config["PHONE_ADDRESS"]
+    if address and len(address) != 17:
+        raise MonitorError("PHONE_ADDRESS must be the paired phone's Bluetooth address (for example AA:BB:CC:DD:EE:FF)")
+    if address and any(
+        (index % 3 == 2 and char != ":") or (index % 3 != 2 and char not in "0123456789ABCDEF")
+        for index, char in enumerate(address)
+    ):
+        raise MonitorError("PHONE_ADDRESS must be a Bluetooth address like AA:BB:CC:DD:EE:FF")
     return config
 
 
@@ -158,69 +171,125 @@ def lock_session(custom_command):
     return any(request_and_verify_lock(method) for method in methods)
 
 
-class GSConnectPresence:
-    """Read a paired phone's Connected property from GSConnect's D-Bus API."""
+class BluezPresence:
+    """Stream RSSI updates for one explicitly selected, paired BlueZ phone."""
 
-    def __init__(self, session_bus, device_name=""):
-        self.session_bus = session_bus
-        self.device_name = device_name.casefold()
-        self.object_path = None
-        self.device_id = None
+    def __init__(self, system_bus, address, on_rssi, on_failure):
+        self.system_bus = system_bus
+        self.address = address.replace(":", "").casefold()
+        self.on_rssi = on_rssi
+        self.on_failure = on_failure
+        self.device_path = None
+        self.adapter_path = None
+        self.owns_discovery = False
+        self.subscriptions = []
 
     @staticmethod
-    def _unpack(value):
+    def _plain(value):
         return value.unpack() if isinstance(value, GLib.Variant) else value
 
-    def _devices(self):
+    def _objects(self):
         try:
-            objects = self.session_bus.call_sync(
-                GSCONNECT,
-                GSCONNECT_PATH,
-                OBJECT_MANAGER,
-                "GetManagedObjects",
-                None,
-                None,
-                Gio.DBusCallFlags.NONE,
-                3000,
-                None,
+            return self.system_bus.call_sync(
+                BLUEZ, "/", OBJECT_MANAGER, "GetManagedObjects", None, None,
+                Gio.DBusCallFlags.NONE, 3000, None,
             ).unpack()[0]
         except GLib.Error as error:
             raise MonitorError(
-                f"cannot read GSConnect devices; make sure GSConnect is enabled and running ({error.message})"
+                f"cannot read BlueZ; check that Bluetooth is enabled and the bluetooth service is running ({error.message})"
             ) from error
-        result = []
-        for path, interfaces in objects.items():
-            properties = interfaces.get(GSCONNECT_DEVICE_IFACE)
-            if properties is None:
-                continue
-            result.append((path, {key: self._unpack(value) for key, value in properties.items()}))
-        return result
 
     def _select_device(self):
-        devices = [
-            (path, props)
-            for path, props in self._devices()
-            if props.get("Paired") and props.get("Type") == "phone"
-        ]
-        if self.device_name:
-            matches = [(path, props) for path, props in devices if props.get("Name", "").casefold() == self.device_name]
-            if len(matches) != 1:
-                raise MonitorError("GSCONNECT_DEVICE_NAME must exactly match one paired GSConnect phone")
-            return matches[0]
-        if len(devices) != 1:
+        if not self.address:
             raise MonitorError(
-                "expected exactly one paired GSConnect phone; set GSCONNECT_DEVICE_NAME in the private config to choose one"
+                "set PHONE_ADDRESS in ~/.config/dynamic_lock/config after pairing your phone in Ubuntu Settings → Bluetooth"
             )
-        return devices[0]
+        matches = []
+        for path, interfaces in self._objects().items():
+            props = interfaces.get(BLUEZ_DEVICE_IFACE)
+            if not props:
+                continue
+            address = str(self._plain(props.get("Address", ""))).replace(":", "").casefold()
+            if address == self.address:
+                matches.append((path, props))
+        if not matches:
+            raise MonitorError(
+                "the configured phone is not known to BlueZ; pair it in Ubuntu Settings → Bluetooth and check PHONE_ADDRESS"
+            )
+        path, props = matches[0]
+        if not self._plain(props.get("Paired", False)):
+            raise MonitorError("the configured Bluetooth device is not paired; pair the phone in Ubuntu Settings → Bluetooth")
+        self.device_path = path
+        self.adapter_path = self._plain(props.get("Adapter"))
+        if not self.adapter_path:
+            raise MonitorError("BlueZ did not report an adapter for the configured phone")
 
-    def check(self):
-        path, properties = self._select_device()
-        if self.object_path is None:
-            self.object_path = path
-            self.device_id = properties.get("Id")
-        elif path != self.object_path or properties.get("Id") != self.device_id:
-            raise MonitorError("the selected GSConnect phone changed; restart after checking the private config")
-        return bool(properties.get("Connected"))
+    def _subscribe(self):
+        self.subscriptions.append(self.system_bus.signal_subscribe(
+            BLUEZ, PROPERTIES_IFACE, "PropertiesChanged", None, None,
+            Gio.DBusSignalFlags.NONE, self._properties_changed,
+        ))
+        self.subscriptions.append(self.system_bus.signal_subscribe(
+            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
+            self._name_owner_changed,
+        ))
+
+    def _properties_changed(self, _connection, _sender, path, _iface, _signal, parameters):
+        interface, changed, _invalidated = parameters.unpack()
+        if interface == BLUEZ_DEVICE_IFACE and path == self.device_path:
+            value = changed.get("RSSI")
+            if value is not None:
+                rssi = self._plain(value)
+                if isinstance(rssi, int):
+                    self.on_rssi(rssi)
+        elif interface == BLUEZ_ADAPTER_IFACE and path == self.adapter_path:
+            if self._plain(changed.get("Powered", True)) is False:
+                self.on_failure("Bluetooth adapter was powered off; monitor stopped without locking.")
+            elif self._plain(changed.get("Discovering", True)) is False:
+                self.on_failure("Bluetooth discovery stopped unexpectedly; monitor stopped without locking.")
+
+    def _name_owner_changed(self, _connection, _sender, _path, _iface, _signal, parameters):
+        name, old_owner, new_owner = parameters.unpack()
+        if name == BLUEZ and old_owner and not new_owner:
+            self.on_failure("BlueZ stopped; monitor stopped without locking. Restart after Bluetooth returns.")
+
+    def start(self):
+        self._select_device()
+        adapter = self._objects().get(self.adapter_path, {}).get(BLUEZ_ADAPTER_IFACE, {})
+        if self._plain(adapter.get("Powered", False)) is not True:
+            raise MonitorError("Bluetooth adapter is powered off; enable Bluetooth and retry")
+        self._subscribe()
+        try:
+            proxy = Gio.DBusProxy.new_sync(
+                self.system_bus, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                BLUEZ, self.adapter_path, BLUEZ_ADAPTER_IFACE, None,
+            )
+            filter_value = {"RSSI": GLib.Variant("n", -127)}
+            proxy.call_sync(
+                "SetDiscoveryFilter", GLib.Variant("(a{sv})", (filter_value,)),
+                Gio.DBusCallFlags.NONE, 5000, None,
+            )
+            proxy.call_sync("StartDiscovery", None, Gio.DBusCallFlags.NONE, 5000, None)
+            self.owns_discovery = True
+        except GLib.Error as error:
+            self.stop()
+            raise MonitorError(f"cannot start Bluetooth RSSI scanning ({error.message}); check Bluetooth permissions and retry") from error
+
+    def stop(self):
+        if self.owns_discovery and self.adapter_path:
+            try:
+                proxy = Gio.DBusProxy.new_sync(
+                    self.system_bus, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                    BLUEZ, self.adapter_path, BLUEZ_ADAPTER_IFACE, None,
+                )
+                proxy.call_sync("StopDiscovery", None, Gio.DBusCallFlags.NONE, 2000, None)
+            except GLib.Error:
+                pass
+            self.owns_discovery = False
+        for subscription in self.subscriptions:
+            self.system_bus.signal_unsubscribe(subscription)
+        self.subscriptions.clear()
 
 
 class Monitor:
@@ -231,10 +300,12 @@ class Monitor:
         self.loop = GLib.MainLoop()
         self.system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         self.session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        self.presence = GSConnectPresence(
-            self.session_bus, config["GSCONNECT_DEVICE_NAME"]
+        self.presence = BluezPresence(
+            self.system_bus, config["PHONE_ADDRESS"], self._rssi_received, self._bluetooth_failed
         )
         self.machine = PresenceMachine(
+            drop_db=config["RSSI_DROP_DB"],
+            stale_seconds=config["RSSI_STALE_SECONDS"],
             away_seconds=config["AWAY_CONFIRM_SECONDS"],
             return_seconds=config["RETURN_CONFIRM_SECONDS"],
         )
@@ -242,9 +313,26 @@ class Monitor:
         self.paused = False
         self.sleeping = False
         self.fatal = False
-        self.next_check = 0.0
         self.idle_warning_shown = False
         self._signal_ids = []
+        self.probe_samples = []
+        self.last_tick = time.monotonic()
+
+    def _rssi_received(self, rssi):
+        now_ms = time.monotonic() * 1000
+        self.machine.observe(rssi, now_ms)
+        self.probe_samples.append(rssi)
+        if self.probe:
+            self._log(f"Bluetooth RSSI: {rssi} dBm; proximity state: {self.machine.state}")
+
+    def _bluetooth_failed(self, message):
+        if self.fatal:
+            return
+        self.fatal = True
+        self._log(f"ERROR: {message}")
+        self.machine.reset()
+        self._write_state("UNKNOWN", message)
+        self.loop.quit()
 
     def _idle_milliseconds(self):
         try:
@@ -283,16 +371,16 @@ class Monitor:
 
     def _description(self, state):
         return {
-            "WAITING_FOR_NEAR": "Waiting for a stable GSConnect connection before arming",
-            "NEAR_ARMED": "Phone is connected in GSConnect; monitor armed",
-            "AWAY_PENDING": "GSConnect phone is disconnected; confirming departure",
-            "AWAY_WAITING_FOR_IDLE": "Phone away; waiting for GNOME idle state",
+            "WAITING_FOR_NEAR": "Waiting for stable nearby Bluetooth RSSI readings before arming",
+            "NEAR_ARMED": "Phone is nearby by Bluetooth signal strength; monitor armed",
+            "AWAY_PENDING": "Bluetooth signal is weak or stale; confirming departure",
+            "AWAY_WAITING_FOR_IDLE": "Phone appears away; waiting for GNOME idle state",
             "LOCK_REQUESTED": "Screen lock requested",
             "LOCKED_AWAY": "Lock requested; waiting for phone return to re-arm",
             "LOCK_FAILED": "Screen lock failed; see service logs",
             "PAUSED": "Paused by user",
             "SUSPENDED": "System is suspending; monitor will re-arm after wake",
-            "UNKNOWN": "GSConnect status unavailable; no lock will be triggered",
+            "UNKNOWN": "Bluetooth status unavailable; no lock will be triggered",
         }.get(state, state)
 
     def _set_state(self, state):
@@ -305,7 +393,6 @@ class Monitor:
 
     def _reset_for_rearm(self, state, message):
         self.machine.reset()
-        self.next_check = time.monotonic() + self.config["POLL_SECONDS"]
         changed = state != self.previous_state
         self.previous_state = state
         self._write_state(state, self._description(state))
@@ -316,36 +403,63 @@ class Monitor:
         preparing = parameters.unpack()[0]
         self.sleeping = bool(preparing)
         if preparing:
-            self._reset_for_rearm("SUSPENDED", "Suspend detected; cleared GSConnect presence state.")
+            self._reset_for_rearm("SUSPENDED", "Suspend detected; cleared Bluetooth readings.")
+            self.presence.stop()
         else:
-            self._reset_for_rearm("WAITING_FOR_NEAR", "Resume detected; waiting for fresh GSConnect status.")
+            self._reset_for_rearm("WAITING_FOR_NEAR", "Resume detected; waiting for fresh Bluetooth readings.")
+            self._resume_discovery()
 
     def _pause(self):
         self.paused = True
-        self._reset_for_rearm("PAUSED", "Paused; monitoring will require fresh GSConnect status when resumed.")
+        self._reset_for_rearm("PAUSED", "Paused; monitoring will require fresh Bluetooth readings when resumed.")
+        self.presence.stop()
         return GLib.SOURCE_CONTINUE
 
     def _resume(self):
         self.paused = False
-        self._reset_for_rearm("WAITING_FOR_NEAR", "Resumed; waiting for a fresh GSConnect connection before arming.")
+        self._reset_for_rearm("WAITING_FOR_NEAR", "Resumed; waiting for fresh Bluetooth readings before arming.")
+        try:
+            self.presence.start()
+        except MonitorError as error:
+            self._bluetooth_failed(f"Could not resume Bluetooth scanning: {error}")
         return GLib.SOURCE_CONTINUE
+
+    def _resume_discovery(self):
+        attempts = 0
+
+        def retry():
+            nonlocal attempts
+            if self.paused or self.sleeping:
+                return GLib.SOURCE_REMOVE
+            attempts += 1
+            try:
+                self.presence.start()
+                self._log("Bluetooth scanning resumed; waiting for fresh nearby readings.")
+                return GLib.SOURCE_REMOVE
+            except MonitorError as error:
+                if attempts >= 6:
+                    self._bluetooth_failed(f"Bluetooth did not recover after resume: {error}")
+                    return GLib.SOURCE_REMOVE
+                return GLib.SOURCE_CONTINUE
+
+        GLib.timeout_add_seconds(2, retry)
 
     def _shutdown(self):
         self.loop.quit()
         return GLib.SOURCE_REMOVE
 
     def start(self):
+        try:
+            self.presence.start()
+        except MonitorError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+
         if self.probe:
-            try:
-                present = self.presence.check()
-            except MonitorError as error:
-                print(f"ERROR: {error}", file=sys.stderr)
-                return 1
-            idle = self._idle_milliseconds()
-            print("GSConnect phone is connected." if present else "GSConnect phone is disconnected.")
-            if idle is not None:
-                print(f"GNOME idle: {idle / 1000:.1f}s")
-            return 0
+            print("Bluetooth RSSI probe active for 20 seconds; it cannot lock the screen.", flush=True)
+            GLib.timeout_add_seconds(20, self._finish_probe)
+            self.loop.run()
+            return 1 if self.fatal else 0
 
         self.system_bus.signal_subscribe(
             "org.freedesktop.login1",
@@ -362,26 +476,35 @@ class Monitor:
             GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, self._shutdown)
 
         self._write_state("WAITING_FOR_NEAR", self._description("WAITING_FOR_NEAR"))
-        print("Monitor active: waiting for a stable GSConnect phone connection before arming.", flush=True)
-        GLib.timeout_add_seconds(1, self._tick)
+        print("Monitor active: waiting for stable nearby Bluetooth RSSI readings before arming.", flush=True)
+        GLib.timeout_add_seconds(self.config["POLL_SECONDS"], self._tick)
         self.loop.run()
+        self.presence.stop()
         return 1 if self.fatal else 0
+
+    def _finish_probe(self):
+        if self.probe_samples:
+            samples = sorted(self.probe_samples)
+            median = samples[len(samples) // 2]
+            print(f"Probe summary: {len(samples)} RSSI readings; median {median} dBm.", flush=True)
+        else:
+            print("Probe summary: no RSSI readings received. Confirm the phone is paired in Ubuntu Bluetooth settings, Bluetooth is on, and it is advertising/discoverable.", flush=True)
+        idle = self._idle_milliseconds()
+        if idle is not None:
+            print(f"GNOME idle: {idle / 1000:.1f}s", flush=True)
+        self.loop.quit()
+        self.presence.stop()
+        return GLib.SOURCE_REMOVE
 
     def _tick(self):
         if self.paused or self.sleeping:
             return GLib.SOURCE_CONTINUE
 
         now = time.monotonic()
-        if now >= self.next_check:
-            self.next_check = now + self.config["POLL_SECONDS"]
-            try:
-                present = self.presence.check()
-            except MonitorError as error:
-                self._reset_for_rearm("UNKNOWN", f"ERROR: GSConnect status unavailable; refusing to lock ({error}).")
-                return GLib.SOURCE_CONTINUE
-            self.machine.observe(present, now * 1000)
-            if self.probe:
-                print("GSConnect phone connected." if present else "GSConnect phone disconnected.", flush=True)
+        if now - self.last_tick > 30:
+            self.machine.reset()
+            self._log("Wake or scheduler gap detected; waiting for fresh near readings before re-arming.")
+        self.last_tick = now
 
         result = self.machine.tick(time.monotonic() * 1000, False)
         if result["state"] == "AWAY_WAITING_FOR_IDLE":

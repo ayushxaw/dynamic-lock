@@ -43,11 +43,17 @@ import os
 import sys
 
 config = Path(sys.argv[1])
-legacy = {"PHONE_ADDRESS", "RSSI_DROP_DB", "RSSI_STALE_SECONDS"}
 lines = config.read_text(encoding="utf-8").splitlines()
-filtered = [line for line in lines if line.split("=", 1)[0].strip() not in legacy]
-if not any(line.split("=", 1)[0].strip() == "GSCONNECT_DEVICE_NAME" for line in filtered if "=" in line):
-    filtered.insert(0, "GSCONNECT_DEVICE_NAME=")
+filtered = [line for line in lines if line.split("=", 1)[0].strip() != "GSCONNECT_DEVICE_NAME"]
+defaults = {
+    "PHONE_ADDRESS": "",
+    "RSSI_DROP_DB": "10",
+    "RSSI_STALE_SECONDS": "15",
+}
+keys = {line.split("=", 1)[0].strip() for line in filtered if "=" in line}
+for key, value in defaults.items():
+    if key not in keys:
+        filtered.insert(0, f"{key}={value}")
 config.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 os.chmod(config, 0o600)
 PY
@@ -55,24 +61,23 @@ PY
 install -m 644 "$SCRIPT_DIR/dynamic_lock.service" "$SYSTEMD_DIR/dynamic_lock.service"
 systemctl --user daemon-reload
 
-if python3 - <<'PY'
-from gi.repository import Gio, GLib
+if python3 - "$CONFIG_DIR/config" <<'PY'
+from pathlib import Path
+import sys
 
-bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-owned = bus.call_sync(
-    "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-    "NameHasOwner", GLib.Variant("(s)", ("org.gnome.Shell.Extensions.GSConnect",)),
-    None, Gio.DBusCallFlags.NONE, 2000, None,
-).unpack()[0]
-raise SystemExit(0 if owned else 1)
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if line.strip().startswith("PHONE_ADDRESS="):
+        raise SystemExit(0 if line.split("=", 1)[1].strip() else 1)
+raise SystemExit(1)
 PY
 then
     systemctl --user enable --now dynamic_lock.service
-    printf '\nInstalled and started the monitor; GSConnect is running.\n'
+    printf '\nInstalled and started the Bluetooth proximity monitor.\n'
 else
     systemctl --user disable dynamic_lock.service >/dev/null 2>&1 || true
-    printf '\nInstalled, but GSConnect is not running in this GNOME session.\n'
-    printf 'Open GSConnect, pair your phone, and then enable with: systemctl --user enable --now dynamic_lock.service\n'
+    printf '\nInstalled; automatic locking is not enabled until you select your phone.\n'
+    printf 'Pair it in Ubuntu Settings → Bluetooth, set PHONE_ADDRESS in %s/config, then run:\n' "$CONFIG_DIR"
+    printf 'systemctl --user enable --now dynamic_lock.service\n'
 fi
 
 printf '\nCommands use the full installed path: %s/dynamic_lock.sh --status\n' "$BIN_DIR"

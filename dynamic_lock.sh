@@ -10,11 +10,11 @@ readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}/dynamic-lock"
 
 usage() {
     cat <<'EOF'
-Dynamic Lock — GSConnect presence lock for GNOME
+Dynamic Lock — Bluetooth proximity lock for GNOME
 
 Usage:
   dynamic_lock.sh --daemon   Run the monitor (used by systemd)
-  dynamic_lock.sh --probe    Check GSConnect connection without locking
+  dynamic_lock.sh --probe    Sample phone Bluetooth RSSI for 20 seconds; never locks
   dynamic_lock.sh --status   Show service and monitor state
   dynamic_lock.sh --pause    Pause the running service
   dynamic_lock.sh --resume   Resume the running service
@@ -46,7 +46,7 @@ case "${1:-}" in
         fi
         if [[ ! -r "$CONFIG_FILE" ]]; then
             printf 'ERROR: config not found: %s\n' "$CONFIG_FILE" >&2
-            printf 'Run install.sh, then pair your phone in GSConnect.\n' >&2
+            printf 'Run install.sh, pair the phone in Ubuntu Bluetooth settings, and set PHONE_ADDRESS in the private config.\n' >&2
             exit 1
         fi
         if [[ ! -r "$MONITOR" ]]; then
