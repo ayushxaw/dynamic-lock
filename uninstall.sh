@@ -16,6 +16,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
 fi
 
 rm -f "$BIN_DIR/dynamic_lock.sh"
+rm -f "$LIB_DIR/dynamic_lock_monitor.py" "$LIB_DIR/dynamic_lock_state.py"
 rm -f "$LIB_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_state.js"
 rmdir "$LIB_DIR" 2>/dev/null || true
 rm -f "$RUNTIME_DIR/state" "$RUNTIME_DIR/state.tmp" "$RUNTIME_DIR/monitor.lock"

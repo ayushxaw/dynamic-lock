@@ -10,9 +10,11 @@ LIB_DIR="${HOME}/.local/lib/dynamic-lock"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-for dependency in gjs flock timeout systemctl install grep; do
+for dependency in python3 flock systemctl install grep; do
     command -v "$dependency" >/dev/null 2>&1 || fail "required command '$dependency' is missing. Install it before running this installer."
 done
+python3 -c 'import gi, socket; assert hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_L2CAP")' >/dev/null 2>&1 || \
+    fail "system Python needs PyGObject and Bluetooth L2CAP support (python3-gi on Ubuntu)."
 systemctl --user show-environment >/dev/null 2>&1 || fail "the systemd user manager is unavailable. Run this from your logged-in GNOME session."
 
 printf '%s\n' '=== Dynamic Lock installer ==='
@@ -23,8 +25,9 @@ fi
 
 install -d -m 755 "$BIN_DIR" "$LIB_DIR" "$SYSTEMD_DIR"
 install -m 755 "$SCRIPT_DIR/dynamic_lock.sh" "$BIN_DIR/dynamic_lock.sh"
-install -m 644 "$SCRIPT_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_monitor.js"
-install -m 644 "$SCRIPT_DIR/dynamic_lock_state.js" "$LIB_DIR/dynamic_lock_state.js"
+install -m 644 "$SCRIPT_DIR/dynamic_lock_monitor.py" "$LIB_DIR/dynamic_lock_monitor.py"
+install -m 644 "$SCRIPT_DIR/dynamic_lock_state.py" "$LIB_DIR/dynamic_lock_state.py"
+rm -f "$LIB_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_state.js"
 
 install -d -m 700 "$CONFIG_DIR"
 if [[ ! -f "$CONFIG_DIR/config" ]]; then
@@ -46,7 +49,7 @@ else
     printf '\nInstalled, but not enabled yet because PHONE_ADDRESS is not configured.\n'
     printf '1. Pair your phone in GNOME Settings → Bluetooth.\n'
     printf '2. Set PHONE_ADDRESS in %s/config.\n' "$CONFIG_DIR"
-    printf '3. Run %s/dynamic_lock.sh --probe and confirm readings change as you move away.\n' "$BIN_DIR"
+    printf '3. Run %s/dynamic_lock.sh --probe and confirm the phone answers the Bluetooth check.\n' "$BIN_DIR"
     printf '4. Enable with: systemctl --user enable --now dynamic_lock.service\n'
 fi
 

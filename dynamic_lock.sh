@@ -5,16 +5,16 @@ set -uo pipefail
 readonly VERSION="2.0.0"
 readonly SERVICE="dynamic_lock.service"
 readonly CONFIG_FILE="${HOME}/.config/dynamic_lock/config"
-readonly MONITOR="${HOME}/.local/lib/dynamic-lock/dynamic_lock_monitor.js"
+readonly MONITOR="${HOME}/.local/lib/dynamic-lock/dynamic_lock_monitor.py"
 readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}/dynamic-lock"
 
 usage() {
     cat <<'EOF'
-Dynamic Lock — Bluetooth RSSI proximity lock for GNOME
+Dynamic Lock — Bluetooth presence lock for GNOME
 
 Usage:
   dynamic_lock.sh --daemon   Run the monitor (used by systemd)
-  dynamic_lock.sh --probe    Show Bluetooth readings without locking
+  dynamic_lock.sh --probe    Check Bluetooth link presence without locking
   dynamic_lock.sh --status   Show service and monitor state
   dynamic_lock.sh --pause    Pause the running service
   dynamic_lock.sh --resume   Resume the running service
@@ -34,12 +34,16 @@ case "${1:-}" in
     --help|-h) usage; exit 0 ;;
     --version|-V) printf 'dynamic_lock %s\n' "$VERSION"; exit 0 ;;
     --daemon)
-        for dependency in gjs flock timeout; do
+        for dependency in python3 flock; do
             if ! command -v "$dependency" >/dev/null 2>&1; then
                 printf 'ERROR: required command not found: %s\n' "$dependency" >&2
                 exit 1
             fi
         done
+        if ! python3 -c 'import gi, socket; assert hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_L2CAP")' >/dev/null 2>&1; then
+            printf 'ERROR: system Python needs PyGObject and Bluetooth L2CAP support. On Ubuntu, install python3-gi and python3.\n' >&2
+            exit 1
+        fi
         if [[ ! -r "$CONFIG_FILE" ]]; then
             printf 'ERROR: config not found: %s\n' "$CONFIG_FILE" >&2
             printf 'Run install.sh, then set PHONE_ADDRESS in the config.\n' >&2
@@ -55,13 +59,13 @@ case "${1:-}" in
             printf 'ERROR: another Dynamic Lock monitor is already running.\n' >&2
             exit 1
         fi
-        exec gjs -I "${HOME}/.local/lib/dynamic-lock" "$MONITOR" \
+        exec python3 "$MONITOR" \
             --config "$CONFIG_FILE" --state "${RUNTIME_DIR}/state"
         ;;
     --probe)
-        command -v gjs >/dev/null 2>&1 || { printf 'ERROR: install gjs (GNOME JavaScript runtime).\n' >&2; exit 1; }
+        command -v python3 >/dev/null 2>&1 || { printf 'ERROR: install python3.\n' >&2; exit 1; }
         [[ -r "$MONITOR" ]] || { printf 'ERROR: monitor not found: %s\n' "$MONITOR" >&2; exit 1; }
-        exec gjs -I "${HOME}/.local/lib/dynamic-lock" "$MONITOR" --probe --config "$CONFIG_FILE"
+        exec python3 "$MONITOR" --probe --config "$CONFIG_FILE"
         ;;
     --status)
         if service_active; then
