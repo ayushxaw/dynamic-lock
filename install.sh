@@ -10,11 +10,10 @@ LIB_DIR="${HOME}/.local/lib/dynamic-lock"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-for dependency in python3 flock systemctl install grep; do
+for dependency in python3 flock systemctl install; do
     command -v "$dependency" >/dev/null 2>&1 || fail "required command '$dependency' is missing. Install it before running this installer."
 done
-python3 -c 'import gi, socket; assert hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_L2CAP")' >/dev/null 2>&1 || \
-    fail "system Python needs PyGObject and Bluetooth L2CAP support (python3-gi on Ubuntu)."
+python3 -c 'import gi' >/dev/null 2>&1 || fail "system Python needs PyGObject (python3-gi on Ubuntu)."
 systemctl --user show-environment >/dev/null 2>&1 || fail "the systemd user manager is unavailable. Run this from your logged-in GNOME session."
 
 printf '%s\n' '=== Dynamic Lock installer ==='
@@ -38,19 +37,42 @@ else
     printf 'Kept existing config and set permissions to 600: %s\n' "$CONFIG_DIR/config"
 fi
 
+python3 - "$CONFIG_DIR/config" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+config = Path(sys.argv[1])
+legacy = {"PHONE_ADDRESS", "RSSI_DROP_DB", "RSSI_STALE_SECONDS"}
+lines = config.read_text(encoding="utf-8").splitlines()
+filtered = [line for line in lines if line.split("=", 1)[0].strip() not in legacy]
+if not any(line.split("=", 1)[0].strip() == "GSCONNECT_DEVICE_NAME" for line in filtered if "=" in line):
+    filtered.insert(0, "GSCONNECT_DEVICE_NAME=")
+config.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+os.chmod(config, 0o600)
+PY
+
 install -m 644 "$SCRIPT_DIR/dynamic_lock.service" "$SYSTEMD_DIR/dynamic_lock.service"
 systemctl --user daemon-reload
 
-if grep -Eiq '^PHONE_ADDRESS=([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$' "$CONFIG_DIR/config"; then
+if python3 - <<'PY'
+from gi.repository import Gio, GLib
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+owned = bus.call_sync(
+    "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+    "NameHasOwner", GLib.Variant("(s)", ("org.gnome.Shell.Extensions.GSConnect",)),
+    None, Gio.DBusCallFlags.NONE, 2000, None,
+).unpack()[0]
+raise SystemExit(0 if owned else 1)
+PY
+then
     systemctl --user enable --now dynamic_lock.service
-    printf '\nInstalled, enabled, and started the monitor.\n'
+    printf '\nInstalled and started the monitor; GSConnect is running.\n'
 else
     systemctl --user disable dynamic_lock.service >/dev/null 2>&1 || true
-    printf '\nInstalled, but not enabled yet because PHONE_ADDRESS is not configured.\n'
-    printf '1. Pair your phone in GNOME Settings → Bluetooth.\n'
-    printf '2. Set PHONE_ADDRESS in %s/config.\n' "$CONFIG_DIR"
-    printf '3. Run %s/dynamic_lock.sh --probe and confirm the phone answers the Bluetooth check.\n' "$BIN_DIR"
-    printf '4. Enable with: systemctl --user enable --now dynamic_lock.service\n'
+    printf '\nInstalled, but GSConnect is not running in this GNOME session.\n'
+    printf 'Open GSConnect, pair your phone, and then enable with: systemctl --user enable --now dynamic_lock.service\n'
 fi
 
 printf '\nCommands use the full installed path: %s/dynamic_lock.sh --status\n' "$BIN_DIR"

@@ -10,11 +10,11 @@ readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}/dynamic-lock"
 
 usage() {
     cat <<'EOF'
-Dynamic Lock — Bluetooth presence lock for GNOME
+Dynamic Lock — GSConnect presence lock for GNOME
 
 Usage:
   dynamic_lock.sh --daemon   Run the monitor (used by systemd)
-  dynamic_lock.sh --probe    Check Bluetooth link presence without locking
+  dynamic_lock.sh --probe    Check GSConnect connection without locking
   dynamic_lock.sh --status   Show service and monitor state
   dynamic_lock.sh --pause    Pause the running service
   dynamic_lock.sh --resume   Resume the running service
@@ -40,13 +40,13 @@ case "${1:-}" in
                 exit 1
             fi
         done
-        if ! python3 -c 'import gi, socket; assert hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_L2CAP")' >/dev/null 2>&1; then
-            printf 'ERROR: system Python needs PyGObject and Bluetooth L2CAP support. On Ubuntu, install python3-gi and python3.\n' >&2
+        if ! python3 -c 'import gi' >/dev/null 2>&1; then
+            printf 'ERROR: system Python needs PyGObject. On Ubuntu, install python3-gi.\n' >&2
             exit 1
         fi
         if [[ ! -r "$CONFIG_FILE" ]]; then
             printf 'ERROR: config not found: %s\n' "$CONFIG_FILE" >&2
-            printf 'Run install.sh, then set PHONE_ADDRESS in the config.\n' >&2
+            printf 'Run install.sh, then pair your phone in GSConnect.\n' >&2
             exit 1
         fi
         if [[ ! -r "$MONITOR" ]]; then
