@@ -111,7 +111,7 @@ Automated tests cover the presence state machine, including arming, departure co
 python3 -m unittest discover -s tests
 ```
 
-On the development laptop, GSConnect reported both connected and disconnected states during a Wi-Fi-off test. The monitor reached `AWAY_PENDING` and `AWAY_WAITING_FOR_IDLE`. A unit mismatch in the idle-time conversion was then fixed; the final live GNOME lock still needs verification after a fresh disconnect.
+On the development laptop, GSConnect reported both connected and disconnected states during a Wi-Fi-off test, and the monitor reached `AWAY_PENDING`. The idle-time unit conversion was fixed. The GNOME D-Bus lock method was manually verified against the session lock hint; a full automatic disconnect-to-lock cycle with the corrected monitor still needs a fresh re-arm and test.
 
 ## Design references
 

@@ -65,16 +65,16 @@ class PresenceMachine:
             self.state = "AWAY_PENDING"
             return {"state": self.state, "should_lock": False}
 
+        if self.locked_once:
+            self.state = "LOCKED_AWAY"
+            return {"state": self.state, "should_lock": False}
+
         if not is_idle:
             self.state = "AWAY_WAITING_FOR_IDLE"
             return {"state": self.state, "should_lock": False}
 
         if self.next_lock_retry_at is not None and now_ms < self.next_lock_retry_at:
             self.state = "LOCK_FAILED"
-            return {"state": self.state, "should_lock": False}
-
-        if self.locked_once:
-            self.state = "LOCKED_AWAY"
             return {"state": self.state, "should_lock": False}
 
         self.locked_once = True

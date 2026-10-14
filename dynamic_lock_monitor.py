@@ -104,26 +104,58 @@ def run_command(argv):
         return False
 
 
+def screen_is_locked():
+    try:
+        result = subprocess.run(
+            (
+                "gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
+                "--object-path", "/org/gnome/ScreenSaver", "--method",
+                "org.gnome.ScreenSaver.GetActive",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+        return result.returncode == 0 and "(true,)" in result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def request_and_verify_lock(argv):
+    if not run_command(argv):
+        return False
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if screen_is_locked():
+            return True
+        time.sleep(0.2)
+    return screen_is_locked()
+
+
 def lock_session(custom_command):
+
     if custom_command:
         try:
             argv = shlex.split(custom_command)
         except ValueError:
             argv = []
             print("ERROR: LOCK_CMD could not be parsed; trying GNOME lock methods.", file=sys.stderr)
-        if argv and run_command(argv):
+        if argv and request_and_verify_lock(argv):
             return True
 
     methods = (
-        ("loginctl", "lock-session"),
         (
             "gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
             "--object-path", "/org/gnome/ScreenSaver", "--method",
             "org.gnome.ScreenSaver.Lock",
         ),
+        ("loginctl", "lock-session"),
         ("xdg-screensaver", "lock"),
     )
-    return any(run_command(method) for method in methods)
+    return any(request_and_verify_lock(method) for method in methods)
 
 
 class GSConnectPresence:

@@ -50,7 +50,7 @@ class PresenceMachineTests(unittest.TestCase):
         self.arm()
         self.machine.observe(False, 15000)
         self.assertTrue(self.machine.tick(45000, True)["should_lock"])
-        self.assertFalse(self.machine.tick(50000, True)["should_lock"])
+        self.assertFalse(self.machine.tick(50000, False)["should_lock"])
         self.assertEqual(self.machine.state, "LOCKED_AWAY")
 
 
