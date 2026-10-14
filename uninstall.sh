@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
-# uninstall.sh — Remove dynamic_lock
+# Remove installed files while preserving the user's private configuration.
 set -euo pipefail
 
-echo "=== Dynamic Lock — Uninstaller ==="
-echo ""
+SYSTEMD_DIR="${HOME}/.config/systemd/user"
+BIN_DIR="${HOME}/.local/bin"
+LIB_DIR="${HOME}/.local/lib/dynamic-lock"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID}}/dynamic-lock"
 
-if systemctl --user is-active dynamic_lock.service &>/dev/null; then
-    echo "Stopping service..."
-    systemctl --user stop dynamic_lock.service
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user disable --now dynamic_lock.service >/dev/null 2>&1 || true
+fi
+rm -f "$SYSTEMD_DIR/dynamic_lock.service"
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user daemon-reload
 fi
 
-if systemctl --user is-enabled dynamic_lock.service &>/dev/null; then
-    echo "Disabling service..."
-    systemctl --user disable dynamic_lock.service
-fi
+rm -f "$BIN_DIR/dynamic_lock.sh"
+rm -f "$LIB_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_state.js"
+rmdir "$LIB_DIR" 2>/dev/null || true
+rm -f "$RUNTIME_DIR/state" "$RUNTIME_DIR/state.tmp" "$RUNTIME_DIR/monitor.lock"
+rmdir "$RUNTIME_DIR" 2>/dev/null || true
 
-rm -f "${HOME}/.config/systemd/user/dynamic_lock.service"
-systemctl --user daemon-reload
-echo "✓ Service removed"
-
-rm -f "${HOME}/.local/bin/dynamic_lock.sh"
-echo "✓ Script removed"
-
-echo ""
-echo "Config preserved at: ~/.config/dynamic_lock/config"
-echo "To remove config too: rm -rf ~/.config/dynamic_lock"
-echo ""
-echo "=== Done ==="
+printf '%s\n' 'Dynamic Lock uninstalled.'
+printf 'Private config preserved at %s/.config/dynamic_lock/config\n' "$HOME"
+printf 'Remove it manually only if you also want to delete your Bluetooth address.\n'

@@ -1,119 +1,140 @@
-# 🔒 dynamic-lock
+# Dynamic Lock for GNOME
 
-windows-style dynamic lock for linux — automatically locks your screen when your phone leaves KDE Connect range.
+Lock a GNOME session after a paired Bluetooth phone moves away, then re-arm when its signal returns. Dynamic Lock uses the phone's Bluetooth signal strength (RSSI), with smoothing and confirmation periods to reduce false triggers. It never unlocks the session.
 
-walk away from your laptop with your phone in your pocket → screen locks in ~30 seconds. come back → re-arms automatically. no idle timers, no manual locking.
+This is a small personal-laptop tool inspired by Windows Dynamic Lock. Microsoft describes its feature as using a paired phone's Bluetooth signal and locking when that signal falls below a threshold, typically within about a minute after leaving range. This project uses its own visible RSSI and timing settings; it cannot reproduce Windows' private signal processing exactly.
 
-```
-phone reachable ──→ phone leaves ──→ ~30 seconds ──→ 🔒 screen locks
-                                                          │
-                    phone returns ←── auto re-arm ←───────┘
-                         │
-                    armed (next disconnect locks again)
-```
+## Support and requirements
 
-## why this exists
+- GNOME session managed by systemd's user manager
+- BlueZ Bluetooth service and a paired phone
+- GJS, `flock`, `timeout`, and systemd user commands
+- A GNOME session bus and Mutter idle monitor
 
-GNOME and KDE have idle lock (lock after X minutes of inactivity). but that doesn't help if you walk away while a video is playing — the screen stays unlocked. and it doesn't help if you step away for 10 seconds — you'd need to wait for the full timeout.
+GSConnect does not provide the BlueZ RSSI feed used here, and KDE Connect's CLI is not required. GSConnect can remain installed for its other features; this monitor reads Bluetooth information from BlueZ directly.
 
-dynamic-lock uses physical proximity instead of idle time. your phone is your key.
+This version targets GNOME with BlueZ. KDE, other desktop environments, non-systemd sessions, and phones that do not provide usable RSSI updates are not supported or verified. Bluetooth range is not a precise distance measurement: walls, body position, radio interference, and adapter/phone behavior can change RSSI.
 
-## how it works
+## Install
 
-1. a lightweight background service polls KDE Connect every 10 seconds to check if your phone is reachable
-2. if the phone is unreachable for 3 consecutive checks (~30 seconds), the screen locks
-3. once locked, the script waits for the phone to return and automatically re-arms
-4. uses grace periods after wake from suspend (15s) and after reconnect (20s) to avoid false locks
-
-no root needed. battery impact is negligible (~1.3MB RAM, <1% CPU).
-
-## requirements
-
-- **linux** with GNOME, KDE, or any desktop with `loginctl`
-- **KDE Connect** installed (`sudo apt install kdeconnect` / `sudo pacman -S kdeconnect`)
-- **KDE Connect app** on your phone ([Google Play](https://play.google.com/store/apps/details?id=org.kde.kdeconnect_tp) / [F-Droid](https://f-droid.org/packages/org.kde.kdeconnect_tp/))
-- phone and laptop on the same network (WiFi)
-
-## quick start
+Pair the phone in **GNOME Settings → Bluetooth** first. Then install:
 
 ```bash
 git clone https://github.com/theayushlab/dynamic-lock.git
 cd dynamic-lock
-chmod +x install.sh
 ./install.sh
 ```
 
-that's it. the daemon starts immediately and auto-starts on login.
+The installer copies the monitor and command wrapper, creates a private config directory with mode `700`, and stores the config with mode `600`. It does not enable the service until a phone address is configured.
 
-## configuration
-
-edit `~/.config/dynamic_lock/config`:
+Find the paired phone's address:
 
 ```bash
-# device ID — leave blank to auto-detect from paired devices
-DEVICE_ID=
+bluetoothctl devices Paired
+```
 
-# seconds between reachability polls (2–300)
-POLL_INTERVAL=10
+Edit `~/.config/dynamic_lock/config` and set `PHONE_ADDRESS` to the phone's Bluetooth address. Keep that address private; do not add your personal config to this repository or paste it into public issue reports. Then test the signal without locking:
 
-# consecutive misses before locking (1–60)
-MISS_THRESHOLD=3
+```bash
+~/.local/bin/dynamic_lock.sh --probe
+```
 
-# seconds to skip miss counting after phone reconnects (0–600)
-GRACE_PERIOD=20
+Move the phone away and back. Confirm that readings change in a useful, repeatable way. Press `Ctrl-C` to stop the probe. When it behaves well, enable the monitor:
 
-# seconds to skip miss counting after waking from suspend (0–600)
-WAKE_GRACE_PERIOD=15
+```bash
+systemctl --user enable --now dynamic_lock.service
+```
 
-# desktop notifications: 1=enabled, 0=disabled
-NOTIFY=1
+If `bluetoothctl devices Paired` is unavailable, install the BlueZ command-line tools for your distribution or get the address from GNOME Bluetooth settings. The `bluetoothctl` command is needed for setup only, not by the daemon.
 
-# override lock command (leave blank for automatic fallback chain)
+## Behavior
+
+1. The monitor starts BlueZ discovery and listens for RSSI changes for the selected paired phone.
+2. It requires three signal readings before arming, so a service restart while the phone is away cannot immediately lock the session.
+3. A relative drop from the strongest nearby signal, or stale readings after the monitor has seen the phone, starts the away confirmation period.
+4. It waits for the configured away period and for GNOME to report the session idle before requesting a lock.
+5. A stable return re-arms the next departure. It does not unlock the session.
+6. On suspend, readings are cleared. On resume, Bluetooth discovery is retried and the monitor must see fresh nearby readings before it can arm again.
+
+The monitor listens for Bluetooth events rather than launching `bluetoothctl` on a polling loop. A one-second local timer advances confirmation periods and checks session idle time only after departure is confirmed.
+
+## Configuration
+
+Edit `~/.config/dynamic_lock/config` while the service is stopped. The file is parsed as simple `KEY=value` lines; it is never sourced or evaluated as shell code. Unknown keys are ignored.
+
+```ini
+PHONE_ADDRESS=AA:BB:CC:DD:EE:FF
+RSSI_DROP_DB=10
+RSSI_STALE_SECONDS=15
+AWAY_CONFIRM_SECONDS=30
+RETURN_CONFIRM_SECONDS=5
+IDLE_AFTER_SECONDS=1
 # LOCK_CMD=loginctl lock-session
 ```
 
-## usage
+- `RSSI_DROP_DB`: relative weakening from the strongest nearby sample that starts departure confirmation (3–30 dB).
+- `RSSI_STALE_SECONDS`: how long without a reading before the phone is treated as potentially away (5–120 seconds).
+- `AWAY_CONFIRM_SECONDS`: how long away evidence must persist before the idle check (5–300 seconds).
+- `RETURN_CONFIRM_SECONDS`: how long the signal must remain in the return band to re-arm (1–60 seconds).
+- `IDLE_AFTER_SECONDS`: required GNOME idle time before locking (0–3600 seconds).
+- `LOCK_CMD`: optional executable and arguments, parsed without a shell. If it fails, built-in GNOME lock methods are tried.
+
+Values outside the documented ranges use safe defaults and are reported in the service log. Because Bluetooth RSSI varies by hardware and environment, use `--probe` and tune one setting at a time. `RSSI_DROP_DB=10` is a starting point, not a guaranteed distance threshold.
+
+## Commands
 
 ```bash
-dynamic_lock.sh --status    # show daemon state
-dynamic_lock.sh --pause     # pause monitoring (e.g., phone charging elsewhere)
-dynamic_lock.sh --resume    # resume monitoring
-dynamic_lock.sh --logs      # view recent logs
-dynamic_lock.sh --version   # print version
+~/.local/bin/dynamic_lock.sh --status
+~/.local/bin/dynamic_lock.sh --pause
+~/.local/bin/dynamic_lock.sh --resume
+~/.local/bin/dynamic_lock.sh --logs
+~/.local/bin/dynamic_lock.sh --version
 ```
 
-## lock method fallback chain
+`--status` shows whether the service is active and its last recorded state; when inactive, that state may be stale. Pause and resume signal the running monitor. After resume it clears readings and waits for the phone nearby before re-arming. Logs come from the user journal:
 
-when your phone disappears, dynamic-lock tries these methods in order:
+```bash
+journalctl --user -u dynamic_lock.service -b
+```
 
-1. `loginctl lock-session` (prefers graphical x11/wayland sessions)
-2. D-Bus `org.freedesktop.ScreenSaver.Lock`
-3. D-Bus `org.gnome.ScreenSaver.Lock`
-4. `gnome-screensaver-command --lock`
-5. `xdg-screensaver lock`
+## Troubleshooting
 
-or set `LOCK_CMD` in config to use your own (e.g., `i3lock`, `swaylock`).
+- **Installer says GJS or a command is missing:** install the named package with your distribution's package manager, then rerun `./install.sh`.
+- **`PHONE_ADDRESS` is missing or malformed:** set it to the paired phone's Bluetooth address in the private config.
+- **Phone is not known to BlueZ / pairing error:** pair it in GNOME Bluetooth settings, check `bluetoothctl devices Paired`, and update the config.
+- **Adapter is unavailable or discovery fails:** turn Bluetooth on, then inspect `journalctl --user -u dynamic_lock.service -b` and the system Bluetooth log (`journalctl -u bluetooth -b`).
+- **No useful RSSI readings:** run `--probe` while moving the phone; some phone/controller combinations do not provide RSSI updates often enough for proximity detection.
+- **Monitor exits after a Bluetooth error:** correct the Bluetooth issue and restart with `systemctl --user restart dynamic_lock.service`. It fails closed instead of treating a broken scanner as proof that the phone left.
+- **It reports idle-monitor or lock errors:** confirm this is a GNOME session, inspect the user journal, and test `loginctl lock-session` manually. The monitor refuses to lock if it cannot read GNOME idle state.
+- **Need to pause temporarily:** use `--pause`; use `--resume` to require a fresh nearby signal before it arms again.
 
-## features
-
-- **3-state reachability check** — distinguishes "phone gone" from "kdeconnect daemon crashed" (no false locks on software issues)
-- **suspend/wake detection** — grace period after waking so KDE Connect has time to reconnect
-- **reconnect grace period** — avoids flapping when phone connection is briefly unstable
-- **safe config parser** — no `source`/`eval`, only known keys accepted
-- **single instance** via `flock` — can't accidentally run two daemons
-- **signal-based pause/resume** — `SIGUSR1` to pause, `SIGUSR2` to resume
-- **timeout on all external calls** — kdeconnect-cli and notify-send can't hang the daemon
-- **integer validation** — non-numeric config values fall back to defaults instead of crashing
-- **lock failure backoff** — if lock command fails, backs off exponentially (30s → 300s)
-- **atomic state file** — write+rename for `--status` reads
-- **systemd hardening** — `ProtectSystem`, `ProtectHome`, `MemoryMax`, `CPUQuota`
-
-## uninstall
+## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-## license
+The uninstaller removes the service and installed program files. It preserves `~/.config/dynamic_lock/config` so you can reinstall without losing settings. Remove that file manually if you also want to delete the stored Bluetooth address.
+
+## Implementation and verification status
+
+Implemented in this version: BlueZ RSSI monitoring, near/away hysteresis, idle-gated lock requests, no automatic unlock, suspend/resume handling, private configuration, pause/resume/status/log commands, and a hardened GNOME user service.
+
+Automated state-machine tests cover arming, away confirmation, idle gating, stale readings, return behavior, lock retries, and invalid RSSI. They do not validate Bluetooth hardware behavior or actual GNOME locking. Run them with:
+
+```bash
+gjs -I . tests/test_state_machine.js
+```
+
+The current development environment has not been tested with the user's phone. RSSI behavior and lock delivery must be verified on the target laptop before relying on it.
+
+## Design references
+
+- [Microsoft: Sign-in options in Windows](https://support.microsoft.com/en-au/accounts-billing/security/sign-in-options-in-windows) describes Dynamic Lock using a paired phone's Bluetooth signal and locking within about a minute after it leaves range.
+- [BlueZ Adapter API](https://bluez.readthedocs.io/en/latest/adapter-api/) documents discovery sessions, RSSI filtering, and device property change signals.
+- [GNOME Desktop IdleMonitor API](https://gnome.pages.gitlab.gnome.org/gnome-desktop/html/gnome-desktop3/gnome-desktop3-GnomeIdleMonitor.html) describes GNOME's Mutter-backed idle time interface.
+- [GNOME session systemd integration](https://gnome.pages.gitlab.gnome.org/gnome-session/re01.html) documents `graphical-session.target` for desktop-session services.
+
+## License
 
 MIT

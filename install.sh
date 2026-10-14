@@ -1,58 +1,53 @@
 #!/usr/bin/env bash
-# install.sh — Install dynamic_lock (KDE Connect proximity lock)
+# Install Dynamic Lock for the current GNOME user.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="${HOME}/.config/dynamic_lock"
 SYSTEMD_DIR="${HOME}/.config/systemd/user"
 BIN_DIR="${HOME}/.local/bin"
+LIB_DIR="${HOME}/.local/lib/dynamic-lock"
 
-echo "=== Dynamic Lock — Installer ==="
-echo ""
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# 0. Stop old version if running
-if systemctl --user is-active dynamic_lock.service &>/dev/null; then
-    echo "[0/4] Stopping existing dynamic_lock..."
+for dependency in gjs flock timeout systemctl install grep; do
+    command -v "$dependency" >/dev/null 2>&1 || fail "required command '$dependency' is missing. Install it before running this installer."
+done
+systemctl --user show-environment >/dev/null 2>&1 || fail "the systemd user manager is unavailable. Run this from your logged-in GNOME session."
+
+printf '%s\n' '=== Dynamic Lock installer ==='
+if systemctl --user is-active --quiet dynamic_lock.service; then
+    printf '%s\n' 'Stopping the existing service...'
     systemctl --user stop dynamic_lock.service
-    echo "      ✓ Stopped"
 fi
 
-# 1. Install the script
-echo "[1/4] Installing dynamic_lock.sh to ${BIN_DIR}/ ..."
-mkdir -p "$BIN_DIR"
-install -m 755 "${SCRIPT_DIR}/dynamic_lock.sh" "${BIN_DIR}/dynamic_lock.sh"
-echo "      ✓ Installed"
+install -d -m 755 "$BIN_DIR" "$LIB_DIR" "$SYSTEMD_DIR"
+install -m 755 "$SCRIPT_DIR/dynamic_lock.sh" "$BIN_DIR/dynamic_lock.sh"
+install -m 644 "$SCRIPT_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_monitor.js"
+install -m 644 "$SCRIPT_DIR/dynamic_lock_state.js" "$LIB_DIR/dynamic_lock_state.js"
 
-# 2. Create config directory & copy example config if none exists
-echo "[2/4] Setting up config at ${CONFIG_DIR} ..."
-mkdir -p "$CONFIG_DIR"
-if [[ ! -f "${CONFIG_DIR}/config" ]]; then
-    cp "${SCRIPT_DIR}/dynamic_lock.conf" "${CONFIG_DIR}/config"
-    echo "      ✓ Created config — edit ${CONFIG_DIR}/config"
+install -d -m 700 "$CONFIG_DIR"
+if [[ ! -f "$CONFIG_DIR/config" ]]; then
+    install -m 600 "$SCRIPT_DIR/dynamic_lock.conf" "$CONFIG_DIR/config"
+    printf 'Created private config: %s\n' "$CONFIG_DIR/config"
 else
-    echo "      ⏭ Config already exists, skipping"
+    chmod 600 "$CONFIG_DIR/config"
+    printf 'Kept existing config and set permissions to 600: %s\n' "$CONFIG_DIR/config"
 fi
 
-# 3. Install systemd user unit
-echo "[3/4] Installing systemd user unit ..."
-mkdir -p "$SYSTEMD_DIR"
-cp "${SCRIPT_DIR}/dynamic_lock.service" "${SYSTEMD_DIR}/"
+install -m 644 "$SCRIPT_DIR/dynamic_lock.service" "$SYSTEMD_DIR/dynamic_lock.service"
 systemctl --user daemon-reload
-echo "      ✓ Unit installed & daemon reloaded"
 
-# 4. Enable and start
-echo "[4/4] Enabling & starting service ..."
-systemctl --user enable --now dynamic_lock.service
-echo "      ✓ Service enabled and started"
+if grep -Eiq '^PHONE_ADDRESS=([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$' "$CONFIG_DIR/config"; then
+    systemctl --user enable --now dynamic_lock.service
+    printf '\nInstalled, enabled, and started the monitor.\n'
+else
+    systemctl --user disable dynamic_lock.service >/dev/null 2>&1 || true
+    printf '\nInstalled, but not enabled yet because PHONE_ADDRESS is not configured.\n'
+    printf '1. Pair your phone in GNOME Settings → Bluetooth.\n'
+    printf '2. Set PHONE_ADDRESS in %s/config.\n' "$CONFIG_DIR"
+    printf '3. Run %s/dynamic_lock.sh --probe and confirm readings change as you move away.\n' "$BIN_DIR"
+    printf '4. Enable with: systemctl --user enable --now dynamic_lock.service\n'
+fi
 
-echo ""
-echo "=== Done! ==="
-echo ""
-echo "Commands:"
-echo "  dynamic_lock.sh --status   Check daemon state"
-echo "  dynamic_lock.sh --pause    Pause monitoring"
-echo "  dynamic_lock.sh --resume   Resume monitoring"
-echo "  dynamic_lock.sh --logs     View recent logs"
-echo "  systemctl --user status dynamic_lock.service"
-echo ""
-echo "Config: ${CONFIG_DIR}/config"
+printf '\nCommands use the full installed path: %s/dynamic_lock.sh --status\n' "$BIN_DIR"
