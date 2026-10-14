@@ -14,6 +14,7 @@ var ProximityMachine = class ProximityMachine {
     reset() {
         this.history = [];
         this.lastSampleAt = null;
+        this.lastSampleWasWeak = false;
         this.baseline = null;
         this.armed = false;
         this.awaySince = null;
@@ -27,6 +28,13 @@ var ProximityMachine = class ProximityMachine {
     observe(rssi, nowMs) {
         if (!Number.isInteger(rssi) || rssi < -127 || rssi > 20)
             return this.state;
+
+        // Old nearby values must not drown out a fresh weak reading after a
+        // long scan gap. Keep the armed baseline, but restart the median window.
+        if (this.lastSampleAt !== null && nowMs - this.lastSampleAt > this.staleMs) {
+            this.history = [];
+            this.returnSince = null;
+        }
 
         this.lastSampleAt = nowMs;
         this.history.push(rssi);
@@ -44,6 +52,7 @@ var ProximityMachine = class ProximityMachine {
         }
 
         const returnThreshold = this.baseline - (this.dropDb / 2);
+        this.lastSampleWasWeak = smooth <= returnThreshold;
         if (smooth > returnThreshold) {
             if (this.returnSince === null)
                 this.returnSince = nowMs;
@@ -86,7 +95,8 @@ var ProximityMachine = class ProximityMachine {
                 // Start a fresh grace period from this stale observation.
                 this.returnSince = null;
                 this.awaySince = nowMs;
-            } else if (this.awaySince === null || this.awaySince < staleAt) {
+            } else if (this.awaySince === null ||
+                (this.awaySince < staleAt && !this.lastSampleWasWeak)) {
                 // A lone weak sample followed by a stalled scanner must not
                 // retain its old timer. Confirm absence from the stale point.
                 this.awaySince = staleAt;

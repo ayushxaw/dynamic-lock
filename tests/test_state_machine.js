@@ -52,6 +52,15 @@ function testStaleReportsRequireTimeoutAndAwayConfirmation() {
     assert(result.shouldLock, 'stale reports plus healthy monitor and idle should lock after grace');
 }
 
+function testFreshWeakSampleAfterGapIsNotMaskedByOldNearbyReadings() {
+    const machine = armedMachine();
+    assert(!machine.tick(17001, true).shouldLock, 'stale readings should only start departure confirmation');
+    machine.observe(-92, 18001);
+    assert(machine.state === 'AWAY_PENDING', 'a fresh weak sample must not be masked by old near samples');
+    assert(machine.history.length === 1, 'fresh samples after a long gap should restart the median window');
+    assert(machine.tick(48002, true).shouldLock, 'confirmed weak signal can lock after the away period');
+}
+
 function testReturnRearmsWithoutUnlocking() {
     const machine = armedMachine();
     machine.observe(-65, 3000);
@@ -91,8 +100,8 @@ function testPartialReturnDoesNotReuseOldDepartureTimer() {
     assert(!machine.tick(34000, true).shouldLock, 'partial return must suppress locking');
     machine.observe(-65, 35000);
     assert(!machine.tick(35001, true).shouldLock, 'drop after partial return starts a fresh grace period');
-    assert(!machine.tick(79999, true).shouldLock, 'fresh away grace period must complete');
-    assert(machine.tick(80000, true).shouldLock, 'fresh away grace period eventually permits locking');
+    assert(!machine.tick(64999, true).shouldLock, 'fresh away grace period must complete');
+    assert(machine.tick(65000, true).shouldLock, 'fresh away grace period eventually permits locking');
 }
 
 function testStalePartialReturnRestartsAwayGrace() {
@@ -117,6 +126,7 @@ const tests = [
     testRequiresNearBeforeAwayLock,
     testSustainedDropAndIdleGate,
     testStaleReportsRequireTimeoutAndAwayConfirmation,
+    testFreshWeakSampleAfterGapIsNotMaskedByOldNearbyReadings,
     testReturnRearmsWithoutUnlocking,
     testLockFailureCanRetry,
     testPartialReturnDoesNotReuseOldDepartureTimer,
