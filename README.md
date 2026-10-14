@@ -37,7 +37,7 @@ no root needed. battery impact is negligible (~1.3MB RAM, <1% CPU).
 ## quick start
 
 ```bash
-git clone https://github.com/ayushxaw/dynamic-lock.git
+git clone https://github.com/theayushlab/dynamic-lock.git
 cd dynamic-lock
 chmod +x install.sh
 ./install.sh
