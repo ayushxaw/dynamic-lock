@@ -1,7 +1,7 @@
 #!/usr/bin/env gjs
 // GNOME/BlueZ event monitor. Bluetooth and idle state are observed over D-Bus;
 // there is no periodic bluetoothctl process or network dependency.
-const {Gio, GLib} = imports.gi;
+const {Gio, GLib, GLibUnix} = imports.gi;
 const System = imports.system;
 const ByteArray = imports.byteArray;
 const {ProximityMachine} = imports.dynamic_lock_state;
@@ -197,7 +197,7 @@ class Monitor {
                     if (Number.isInteger(rssi)) {
                         const state = this.machine.observe(rssi, GLib.get_monotonic_time() / 1000);
                         if (this.probeOnly)
-                            print(`RSSI ${rssi} dBm; filtered state ${state}`);
+                            print(`[${new Date().toISOString()}] RSSI ${rssi} dBm; filtered state ${state}`);
                     }
                 } else if (iface === ADAPTER_IFACE && path === this.adapterPath) {
                     if (prop(changed, 'Powered') === false) {
@@ -331,7 +331,7 @@ class Monitor {
     }
 
     _signals() {
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 10, () => {
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, 10, () => {
             this.paused = true;
             this.machine.reset();
             this._stopDiscovery();
@@ -339,7 +339,7 @@ class Monitor {
             print('Paused; monitoring will require fresh near readings when resumed.');
             return GLib.SOURCE_CONTINUE;
         });
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 12, () => {
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, 12, () => {
             this.paused = false;
             this.machine.reset();
             try {
@@ -352,7 +352,7 @@ class Monitor {
             return GLib.SOURCE_CONTINUE;
         });
         for (const signal of [2, 15, 1]) {
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal, () => {
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal, () => {
                 this.loop.quit();
                 return GLib.SOURCE_REMOVE;
             });
