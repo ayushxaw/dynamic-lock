@@ -60,7 +60,7 @@ function readConfig(path) {
 
     const integerSettings = {
         RSSI_DROP_DB: [10, 3, 30],
-        RSSI_STALE_SECONDS: [15, 5, 120],
+        RSSI_STALE_SECONDS: [30, 5, 120],
         AWAY_CONFIRM_SECONDS: [30, 5, 300],
         RETURN_CONFIRM_SECONDS: [5, 1, 60],
         IDLE_AFTER_SECONDS: [1, 0, 3600],

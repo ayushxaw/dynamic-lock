@@ -3,7 +3,7 @@
 var ProximityMachine = class ProximityMachine {
     constructor(options = {}) {
         this.dropDb = options.dropDb ?? 10;
-        this.staleMs = (options.staleSeconds ?? 15) * 1000;
+        this.staleMs = (options.staleSeconds ?? 30) * 1000;
         this.awayMs = (options.awaySeconds ?? 30) * 1000;
         this.returnMs = (options.returnSeconds ?? 5) * 1000;
         this.armSamples = options.armSamples ?? 3;

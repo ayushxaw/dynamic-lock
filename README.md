@@ -65,7 +65,7 @@ Edit `~/.config/dynamic_lock/config` while the service is stopped. The file is p
 ```ini
 PHONE_ADDRESS=AA:BB:CC:DD:EE:FF
 RSSI_DROP_DB=10
-RSSI_STALE_SECONDS=15
+RSSI_STALE_SECONDS=30
 AWAY_CONFIRM_SECONDS=30
 RETURN_CONFIRM_SECONDS=5
 IDLE_AFTER_SECONDS=1
