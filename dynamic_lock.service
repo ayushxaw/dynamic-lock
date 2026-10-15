@@ -11,7 +11,7 @@ ExecStart=%h/.local/bin/dynamic_lock.sh --daemon
 Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus"
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=5
+TimeoutStopSec=20
 KillSignal=SIGTERM
 UMask=0077
 
@@ -24,6 +24,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%t/dynamic-lock
 PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH
+RestrictSUIDSGID=true
+LockPersonality=true
 
 StandardOutput=journal
 StandardError=journal

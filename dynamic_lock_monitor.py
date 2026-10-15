@@ -1,562 +1,431 @@
 #!/usr/bin/env python3
-"""GNOME user monitor using paired-phone Bluetooth signal strength."""
+"""GNOME monitor with one bounded radio worker and a responsive GLib main loop."""
 
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
+import json
 import os
-import shlex
+from pathlib import Path
 import signal
-import subprocess
 import sys
 import time
 
-import gi
+try:
+    import gi
+    gi.require_version('Gio', '2.0')
+    gi.require_version('GLib', '2.0')
+    from gi.repository import Gio, GLib, GLibUnix
+except (ImportError, ValueError):
+    print('ERROR: system Python needs PyGObject with Gio/GLibUnix. On Ubuntu install python3-gi gir1.2-glib-2.0.', file=sys.stderr)
+    raise SystemExit(1)
 
-gi.require_version("Gio", "2.0")
-gi.require_version("GLib", "2.0")
-from gi.repository import Gio, GLib, GLibUnix
-
+from dynamic_lock_bluetooth import ConnectionSensor, Sample, SensorError, select_target
+from dynamic_lock_config import ConfigError, read_config
+from dynamic_lock_desktop import Desktop, lock_settings_problem
 from dynamic_lock_state import PresenceMachine
 
-
-BLUEZ = "org.bluez"
-BLUEZ_DEVICE_IFACE = "org.bluez.Device1"
-BLUEZ_ADAPTER_IFACE = "org.bluez.Adapter1"
-PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
-OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
-MUTTER_IDLE = "org.gnome.Mutter.IdleMonitor"
-MUTTER_PATH = "/org/gnome/Mutter/IdleMonitor/Core"
+BLUEZ = 'org.bluez'
+DEVICE = 'org.bluez.Device1'
+ADAPTER = 'org.bluez.Adapter1'
+PROPERTIES = 'org.freedesktop.DBus.Properties'
+OBJECT_MANAGER = 'org.freedesktop.DBus.ObjectManager'
 
 
-class MonitorError(Exception):
-    pass
+def milliseconds():
+    return time.monotonic() * 1000
 
 
-def read_config(path):
-    try:
-        with open(path, encoding="utf-8") as config_file:
-            lines = config_file.readlines()
-    except OSError as error:
-        raise MonitorError(f"cannot read config {path}: {error}") from error
+def sleep_offset():
+    # CLOCK_MONOTONIC pauses during suspend; BOOTTIME does not.
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
 
-    allowed = {
-        "PHONE_ADDRESS",
-        "RSSI_DROP_DB",
-        "RSSI_STALE_SECONDS",
-        "AWAY_CONFIRM_SECONDS",
-        "RETURN_CONFIRM_SECONDS",
-        "IDLE_AFTER_SECONDS",
-        "POLL_SECONDS",
-        "LOCK_CMD",
-    }
-    legacy = {"GSCONNECT_DEVICE_NAME"}
-    values = {}
-    for number, raw in enumerate(lines, 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            print(f"WARN: ignoring malformed config line {number}", file=sys.stderr)
-            continue
-        key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip()
-        if key in legacy:
-            print(f"WARN: {key} is obsolete; this monitor uses Bluetooth RSSI.", file=sys.stderr)
-            continue
-        if key not in allowed:
-            print(f"WARN: ignoring unknown config key {key}", file=sys.stderr)
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key] = value
 
-    settings = {
-        "RSSI_DROP_DB": (10, 3, 30),
-        "RSSI_STALE_SECONDS": (15, 5, 120),
-        "AWAY_CONFIRM_SECONDS": (30, 5, 300),
-        "RETURN_CONFIRM_SECONDS": (5, 1, 60),
-        "IDLE_AFTER_SECONDS": (1, 0, 3600),
-        "POLL_SECONDS": (5, 2, 30),
-    }
-    config = {
-        "PHONE_ADDRESS": values.get("PHONE_ADDRESS", "").upper(),
-        "LOCK_CMD": values.get("LOCK_CMD", ""),
-    }
-    for key, (fallback, minimum, maximum) in settings.items():
-        raw = values.get(key, str(fallback))
+class BluezTarget:
+    def __init__(self, bus, address):
+        self.bus, self.address = bus, address
+        self.target = None
+
+    def __call__(self):
         try:
-            number = int(raw)
-        except ValueError:
-            number = fallback
-            print(f"WARN: {key} is not an integer; using {fallback}", file=sys.stderr)
-        if number < minimum or number > maximum:
-            number = fallback
-            print(f"WARN: {key} must be {minimum}–{maximum}; using {fallback}", file=sys.stderr)
-        config[key] = number
-    address = config["PHONE_ADDRESS"]
-    if address and len(address) != 17:
-        raise MonitorError("PHONE_ADDRESS must be the paired phone's Bluetooth address (for example AA:BB:CC:DD:EE:FF)")
-    if address and any(
-        (index % 3 == 2 and char != ":") or (index % 3 != 2 and char not in "0123456789ABCDEF")
-        for index, char in enumerate(address)
-    ):
-        raise MonitorError("PHONE_ADDRESS must be a Bluetooth address like AA:BB:CC:DD:EE:FF")
-    return config
-
-
-def run_command(argv):
-    try:
-        completed = subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=5,
-        )
-        return completed.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def screen_is_locked():
-    try:
-        result = subprocess.run(
-            (
-                "gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
-                "--object-path", "/org/gnome/ScreenSaver", "--method",
-                "org.gnome.ScreenSaver.GetActive",
-            ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-            timeout=3,
-        )
-        return result.returncode == 0 and "(true,)" in result.stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def request_and_verify_lock(argv):
-    if not run_command(argv):
-        return False
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if screen_is_locked():
-            return True
-        time.sleep(0.2)
-    return screen_is_locked()
-
-
-def lock_session(custom_command):
-
-    if custom_command:
-        try:
-            argv = shlex.split(custom_command)
-        except ValueError:
-            argv = []
-            print("ERROR: LOCK_CMD could not be parsed; trying GNOME lock methods.", file=sys.stderr)
-        if argv and request_and_verify_lock(argv):
-            return True
-
-    methods = (
-        (
-            "gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver",
-            "--object-path", "/org/gnome/ScreenSaver", "--method",
-            "org.gnome.ScreenSaver.Lock",
-        ),
-        ("loginctl", "lock-session"),
-        ("xdg-screensaver", "lock"),
-    )
-    return any(request_and_verify_lock(method) for method in methods)
-
-
-class BluezPresence:
-    """Stream RSSI updates for one explicitly selected, paired BlueZ phone."""
-
-    def __init__(self, system_bus, address, on_rssi, on_failure):
-        self.system_bus = system_bus
-        self.address = address.replace(":", "").casefold()
-        self.on_rssi = on_rssi
-        self.on_failure = on_failure
-        self.device_path = None
-        self.adapter_path = None
-        self.owns_discovery = False
-        self.subscriptions = []
-
-    @staticmethod
-    def _plain(value):
-        return value.unpack() if isinstance(value, GLib.Variant) else value
-
-    def _objects(self):
-        try:
-            return self.system_bus.call_sync(
-                BLUEZ, "/", OBJECT_MANAGER, "GetManagedObjects", None, None,
-                Gio.DBusCallFlags.NONE, 3000, None,
-            ).unpack()[0]
+            objects = self.bus.call_sync(BLUEZ, '/', OBJECT_MANAGER, 'GetManagedObjects',
+                None, None, Gio.DBusCallFlags.NO_AUTO_START, 1500, None).unpack()[0]
         except GLib.Error as error:
-            raise MonitorError(
-                f"cannot read BlueZ; check that Bluetooth is enabled and the bluetooth service is running ({error.message})"
-            ) from error
+            raise SensorError('BlueZ unavailable; enable Bluetooth and check the bluetooth service. Retrying automatically.') from error
+        self.target = select_target(objects, self.address)
+        return self.target
 
-    def _select_device(self):
-        if not self.address:
-            raise MonitorError(
-                "set PHONE_ADDRESS in ~/.config/dynamic_lock/config after pairing your phone in Ubuntu Settings → Bluetooth"
-            )
-        matches = []
-        for path, interfaces in self._objects().items():
-            props = interfaces.get(BLUEZ_DEVICE_IFACE)
-            if not props:
-                continue
-            address = str(self._plain(props.get("Address", ""))).replace(":", "").casefold()
-            if address == self.address:
-                matches.append((path, props))
-        if not matches:
-            raise MonitorError(
-                "the configured phone is not known to BlueZ; pair it in Ubuntu Settings → Bluetooth and check PHONE_ADDRESS"
-            )
-        path, props = matches[0]
-        if not self._plain(props.get("Paired", False)):
-            raise MonitorError("the configured Bluetooth device is not paired; pair the phone in Ubuntu Settings → Bluetooth")
-        self.device_path = path
-        self.adapter_path = self._plain(props.get("Adapter"))
-        if not self.adapter_path:
-            raise MonitorError("BlueZ did not report an adapter for the configured phone")
 
-    def _subscribe(self):
-        self.subscriptions.append(self.system_bus.signal_subscribe(
-            BLUEZ, PROPERTIES_IFACE, "PropertiesChanged", None, None,
-            Gio.DBusSignalFlags.NONE, self._properties_changed,
-        ))
-        self.subscriptions.append(self.system_bus.signal_subscribe(
-            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
-            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
-            self._name_owner_changed,
-        ))
+class RadioWorker:
+    """One outstanding job, no growing executor queue. Sockets stay on this thread."""
+    def __init__(self, sensor):
+        self.sensor = sensor
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='bluetooth')
+        self.busy = False
+        self.generation = 0
+        self.worker_generation = -1
+        self.dirty = True
 
-    def _properties_changed(self, _connection, _sender, path, _iface, _signal, parameters):
-        interface, changed, _invalidated = parameters.unpack()
-        if interface == BLUEZ_DEVICE_IFACE and path == self.device_path:
-            value = changed.get("RSSI")
-            if value is not None:
-                rssi = self._plain(value)
-                if isinstance(rssi, int):
-                    self.on_rssi(rssi)
-        elif interface == BLUEZ_ADAPTER_IFACE and path == self.adapter_path:
-            if self._plain(changed.get("Powered", True)) is False:
-                self.on_failure("Bluetooth adapter was powered off; monitor stopped without locking.")
-            elif self._plain(changed.get("Discovering", True)) is False:
-                self.on_failure("Bluetooth discovery stopped unexpectedly; monitor stopped without locking.")
+    def invalidate(self):
+        self.generation += 1
+        self.dirty = True
 
-    def _name_owner_changed(self, _connection, _sender, _path, _iface, _signal, parameters):
-        name, old_owner, new_owner = parameters.unpack()
-        if name == BLUEZ and old_owner and not new_owner:
-            self.on_failure("BlueZ stopped; monitor stopped without locking. Restart after Bluetooth returns.")
+    def submit(self, callback, measure=True):
+        if self.busy:
+            return False
+        self.busy = True
+        generation = self.generation
+        self.dirty = False
 
-    def start(self):
-        self._select_device()
-        adapter = self._objects().get(self.adapter_path, {}).get(BLUEZ_ADAPTER_IFACE, {})
-        if self._plain(adapter.get("Powered", False)) is not True:
-            raise MonitorError("Bluetooth adapter is powered off; enable Bluetooth and retry")
-        self._subscribe()
-        try:
-            proxy = Gio.DBusProxy.new_sync(
-                self.system_bus, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
-                BLUEZ, self.adapter_path, BLUEZ_ADAPTER_IFACE, None,
-            )
-            filter_value = {"RSSI": GLib.Variant("n", -127)}
-            proxy.call_sync(
-                "SetDiscoveryFilter", GLib.Variant("(a{sv})", (filter_value,)),
-                Gio.DBusCallFlags.NONE, 5000, None,
-            )
-            proxy.call_sync("StartDiscovery", None, Gio.DBusCallFlags.NONE, 5000, None)
-            self.owns_discovery = True
-        except GLib.Error as error:
-            self.stop()
-            raise MonitorError(f"cannot start Bluetooth RSSI scanning ({error.message}); check Bluetooth permissions and retry") from error
+        def work():
+            offset = sleep_offset()
+            if self.worker_generation != generation or not measure:
+                self.sensor.close()
+                self.worker_generation = generation
+            result = self.sensor.sample() if measure else None
+            if abs(sleep_offset() - offset) > 2:
+                self.sensor.close()
+                result = Sample('unknown', 'Suspend interrupted measurement; fresh arming required.')
+            return result, time.monotonic(), sleep_offset()
 
-    def stop(self):
-        if self.owns_discovery and self.adapter_path:
+        def done(future):
             try:
-                proxy = Gio.DBusProxy.new_sync(
-                    self.system_bus, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
-                    BLUEZ, self.adapter_path, BLUEZ_ADAPTER_IFACE, None,
-                )
-                proxy.call_sync("StopDiscovery", None, Gio.DBusCallFlags.NONE, 2000, None)
-            except GLib.Error:
-                pass
-            self.owns_discovery = False
-        for subscription in self.subscriptions:
-            self.system_bus.signal_unsubscribe(subscription)
-        self.subscriptions.clear()
+                result = future.result()
+            except Exception:
+                # No exception repr: OS/BlueZ errors may contain private addresses.
+                result = (Sample('unknown', 'Unexpected sensor failure; see --doctor and report the software version.'),
+                          time.monotonic(), sleep_offset())
+            GLib.idle_add(deliver, *result)
+
+        def deliver(result, completed_at, offset):
+            self.busy = False
+            if generation == self.generation:
+                if time.monotonic() - completed_at > 3 or abs(sleep_offset() - offset) > 2:
+                    self.invalidate()
+                    result = Sample('unknown', 'Delayed measurement discarded; fresh arming required.')
+                callback(result)
+            return GLib.SOURCE_REMOVE
+
+        self.executor.submit(work).add_done_callback(done)
+        return True
+
+    def close(self):
+        self.invalidate()
+        # At most one bounded operation remains. Close after it, on the same worker.
+        self.executor.submit(self.sensor.close)
+        self.executor.shutdown(wait=True, cancel_futures=False)
 
 
 class Monitor:
-    def __init__(self, config, state_path=None, probe=False):
-        self.config = config
-        self.state_path = state_path
-        self.probe = probe
+    def __init__(self, config, state_path=None, dry_run=False, duration=0):
+        self.config, self.state_path = config, state_path
+        self.dry_run, self.duration = dry_run, duration
         self.loop = GLib.MainLoop()
         self.system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-        self.session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        self.presence = BluezPresence(
-            self.system_bus, config["PHONE_ADDRESS"], self._rssi_received, self._bluetooth_failed
-        )
-        self.machine = PresenceMachine(
-            drop_db=config["RSSI_DROP_DB"],
-            stale_seconds=config["RSSI_STALE_SECONDS"],
-            away_seconds=config["AWAY_CONFIRM_SECONDS"],
-            return_seconds=config["RETURN_CONFIRM_SECONDS"],
-        )
-        self.previous_state = ""
-        self.paused = False
-        self.sleeping = False
-        self.fatal = False
-        self.idle_warning_shown = False
-        self._signal_ids = []
-        self.probe_samples = []
+        self.desktop = Desktop(Gio.bus_get_sync(Gio.BusType.SESSION, None))
+        self.target = BluezTarget(self.system_bus, config['PHONE_ADDRESS'])
+        self.worker = RadioWorker(ConnectionSensor(self.target))
+        self.machine = PresenceMachine(near_threshold=config['RSSI_NEAR_THRESHOLD'],
+            away_threshold=config['RSSI_AWAY_THRESHOLD'], stale_seconds=config['RSSI_STALE_SECONDS'],
+            away_seconds=config['AWAY_CONFIRM_SECONDS'], return_seconds=config['RETURN_CONFIRM_SECONDS'])
+        self.paused = self.sleeping = self.stopping = self.desktop_busy = False
         self.last_tick = time.monotonic()
+        self.sleep_delta = sleep_offset()
+        self.next_sample = 0
+        self.faults = 0
+        self.health = 'unknown'
+        self.sensor_reason = 'Waiting for the first measurement.'
+        self.inhibited = ''
+        self.previous_status = None
+        self.subscriptions = []
+        self.sources = []
+        self.counts = {'measured': 0, 'absent': 0, 'unknown': 0, 'lock_decisions': 0, 'confirmed_locks': 0}
+        self.started = time.monotonic()
 
-    def _rssi_received(self, rssi):
-        now_ms = time.monotonic() * 1000
-        self.machine.observe(rssi, now_ms)
-        self.probe_samples.append(rssi)
-        if self.probe:
-            self._log(f"Bluetooth RSSI: {rssi} dBm; proximity state: {self.machine.state}")
+    @staticmethod
+    def log(message):
+        print('[dynamic_lock] ' + message, flush=True)
 
-    def _bluetooth_failed(self, message):
-        if self.fatal:
-            return
-        self.fatal = True
-        self._log(f"ERROR: {message}")
-        self.machine.reset()
-        self._write_state("UNKNOWN", message)
-        self.loop.quit()
-
-    def _idle_milliseconds(self):
-        try:
-            proxy = Gio.DBusProxy.new_sync(
-                self.session_bus,
-                Gio.DBusProxyFlags.DO_NOT_AUTO_START,
-                None,
-                MUTTER_IDLE,
-                MUTTER_PATH,
-                MUTTER_IDLE,
-                None,
-            )
-            value = proxy.call_sync("GetIdletime", None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
-            # Mutter's GetIdletime returns milliseconds; keep this unit for
-            # comparison with IDLE_AFTER_SECONDS * 1000 in the state loop.
-            return float(value)
-        except GLib.Error as error:
-            if not self.idle_warning_shown:
-                self.idle_warning_shown = True
-                self._log(f"ERROR: GNOME idle monitor unavailable; refusing to lock without idle confirmation ({error.message}).")
-            return None
-
-    def _write_state(self, state, description):
-        if not self.state_path or self.probe:
-            return
-        temporary = f"{self.state_path}.tmp"
-        try:
-            with open(temporary, "w", encoding="utf-8") as state_file:
-                state_file.write(f"State: {state}\n{description}\n")
-            os.replace(temporary, self.state_path)
-        except OSError as error:
-            self._log(f"WARN: could not update runtime status: {error}")
-
-    def _log(self, message):
-        print(f"[dynamic_lock] {message}", flush=True)
-
-    def _description(self, state):
-        return {
-            "WAITING_FOR_NEAR": "Waiting for stable nearby Bluetooth RSSI readings before arming",
-            "NEAR_ARMED": "Phone is nearby by Bluetooth signal strength; monitor armed",
-            "AWAY_PENDING": "Bluetooth signal is weak or stale; confirming departure",
-            "AWAY_WAITING_FOR_IDLE": "Phone appears away; waiting for GNOME idle state",
-            "LOCK_REQUESTED": "Screen lock requested",
-            "LOCKED_AWAY": "Lock requested; waiting for phone return to re-arm",
-            "LOCK_FAILED": "Screen lock failed; see service logs",
-            "PAUSED": "Paused by user",
-            "SUSPENDED": "System is suspending; monitor will re-arm after wake",
-            "UNKNOWN": "Bluetooth status unavailable; no lock will be triggered",
-        }.get(state, state)
-
-    def _set_state(self, state):
-        if state == self.previous_state:
-            return
-        self.previous_state = state
-        self._write_state(state, self._description(state))
-        if not self.probe:
-            self._log(f"State: {state}")
-
-    def _reset_for_rearm(self, state, message):
-        self.machine.reset()
-        changed = state != self.previous_state
-        self.previous_state = state
-        self._write_state(state, self._description(state))
-        if changed and not self.probe:
-            self._log(message)
-
-    def _prepare_for_sleep(self, _connection, _sender, _path, _iface, _signal, parameters):
-        preparing = parameters.unpack()[0]
-        self.sleeping = bool(preparing)
-        if preparing:
-            self._reset_for_rearm("SUSPENDED", "Suspend detected; cleared Bluetooth readings.")
-            self.presence.stop()
-        else:
-            self._reset_for_rearm("WAITING_FOR_NEAR", "Resume detected; waiting for fresh Bluetooth readings.")
-            self._resume_discovery()
+    def invalidate(self, reason):
+        self.worker.invalidate()
+        self.machine.unknown(reason)
+        self.health, self.sensor_reason = 'unknown', reason
+        self.next_sample = 0
+        self.inhibited = reason
+        self._status()
 
     def _pause(self):
-        self.paused = True
-        self._reset_for_rearm("PAUSED", "Paused; monitoring will require fresh Bluetooth readings when resumed.")
-        self.presence.stop()
+        if not self.paused:
+            self.paused = True
+            self.invalidate('Paused by user; resume requires fresh nearby readings.')
         return GLib.SOURCE_CONTINUE
 
     def _resume(self):
-        self.paused = False
-        self._reset_for_rearm("WAITING_FOR_NEAR", "Resumed; waiting for fresh Bluetooth readings before arming.")
-        try:
-            self.presence.start()
-        except MonitorError as error:
-            self._bluetooth_failed(f"Could not resume Bluetooth scanning: {error}")
+        if self.paused:
+            self.paused = False
+            self.invalidate('Resumed; waiting for fresh nearby readings.')
         return GLib.SOURCE_CONTINUE
 
-    def _resume_discovery(self):
-        attempts = 0
+    def _prepare_for_sleep(self, _bus, _sender, _path, _iface, _signal, parameters):
+        preparing = bool(parameters.unpack()[0])
+        if preparing != self.sleeping:
+            self.sleeping = preparing
+            self.invalidate('Suspend/resume; discarded earlier readings and in-flight results.')
+            self.sleep_delta = sleep_offset()
+            self.last_tick = time.monotonic()
 
-        def retry():
-            nonlocal attempts
-            if self.paused or self.sleeping:
-                return GLib.SOURCE_REMOVE
-            attempts += 1
-            try:
-                self.presence.start()
-                self._log("Bluetooth scanning resumed; waiting for fresh nearby readings.")
-                return GLib.SOURCE_REMOVE
-            except MonitorError as error:
-                if attempts >= 6:
-                    self._bluetooth_failed(f"Bluetooth did not recover after resume: {error}")
-                    return GLib.SOURCE_REMOVE
-                return GLib.SOURCE_CONTINUE
+    def _bluez_changed(self, _bus, _sender, path, _iface, name, parameters):
+        values = parameters.unpack()
+        target = self.target.target
+        if name == 'NameOwnerChanged':
+            if values[0] == BLUEZ:
+                self.invalidate('BlueZ restarted or stopped; fresh arming required.')
+        elif target and name == 'PropertiesChanged':
+            interface, changed, invalid = values
+            relevant = ((path == target.adapter_path and interface == ADAPTER and
+                         ('Powered' in changed or 'Powered' in invalid)) or
+                        (path == target.device_path and interface == DEVICE and
+                         ('Paired' in changed or 'Paired' in invalid or 'Adapter' in changed)))
+            if relevant:
+                self.invalidate('Bluetooth adapter or pairing changed; fresh arming required.')
+        elif target and name == 'InterfacesRemoved' and values[0] in (target.device_path, target.adapter_path):
+            self.invalidate('Bluetooth adapter or pairing removed; fresh arming required.')
 
-        GLib.timeout_add_seconds(2, retry)
+    def _received(self, sample):
+        if sample is None or self.paused or self.sleeping or self.stopping:
+            return
+        now = time.monotonic()
+        self.counts[sample.kind] += 1
+        self.health, self.sensor_reason = sample.kind, sample.reason
+        self.machine.accept(sample.kind, now * 1000, sample.rssi, sample.reason)
+        self.faults = min(4, self.faults + 1) if sample.kind == 'unknown' else 0
+        delay = min(30, self.config['POLL_SECONDS'] * 2 ** max(0, self.faults - 1))
+        # Keep the normal cadence relative to sample start; slow operations never
+        # create queued work. Only faults add an increasing recovery delay.
+        self.next_sample = now + delay if self.faults else max(self.next_sample, now)
+        self.inhibited = sample.reason if sample.kind == 'unknown' else ''
+        if self.dry_run:
+            self.log(f'Sample: {sample.kind}; connection RSSI={sample.rssi}; {sample.reason}')
+        self._decide()
+        self._status()
 
-    def _shutdown(self):
-        self.loop.quit()
-        return GLib.SOURCE_REMOVE
+    def _guard(self, generation):
+        return (generation == self.worker.generation and not self.stopping and not self.paused
+                and not self.sleeping and self.health in ('measured', 'absent')
+                and self.machine.last_sample_at is not None
+                and 0 <= milliseconds() - self.machine.last_sample_at <= 3000
+                and self.machine.away_since is not None)
 
-    def start(self):
+    def _decide(self):
+        # Only a newly completed healthy measurement can start the desktop chain.
+        now = milliseconds()
+        self.machine.tick(now, False)
+        if self.desktop_busy or not self.machine.eligible(now):
+            return
+        generation = self.worker.generation
+        problem = lock_settings_problem()
+        if problem:
+            self.inhibited = problem
+            return
+        self.desktop_busy = True
+
+        def idle_received(idle_ms):
+            if not self._guard(generation):
+                self.desktop_busy = False
+                return
+            if idle_ms is None:
+                self.inhibited = 'GNOME idle monitor unavailable; no lock without idle confirmation.'
+                self.desktop_busy = False
+                self._status()
+                return
+            result = self.machine.tick(milliseconds(), idle_ms >= self.config['IDLE_AFTER_SECONDS'] * 1000)
+            if not result['should_lock']:
+                self.desktop_busy = False
+                self._status()
+                return
+            self.counts['lock_decisions'] += 1
+            if self.dry_run:
+                self.log('DRY RUN: would lock now. No lock command was sent.')
+                self.machine.lock_succeeded()
+                self.desktop_busy = False
+                self._status()
+                return
+
+            def locked(success):
+                self.desktop_busy = False
+                if generation != self.worker.generation:
+                    return
+                if success:
+                    self.counts['confirmed_locks'] += 1
+                    self.machine.lock_succeeded()
+                    self.log('GNOME reports lock screen active. Phone return will only re-arm.')
+                else:
+                    self.machine.lock_failed(milliseconds())
+                    self.log('ERROR: lock could not be confirmed. Check GNOME lock settings with --doctor; retry is delayed.')
+                self._status()
+            self.desktop.lock(self.config['LOCK_CMD'], lambda: self._guard(generation), locked)
+        self.desktop.idle(idle_received)
+
+    def _status(self):
+        state = 'PAUSED' if self.paused else 'SUSPENDED' if self.sleeping else self.machine.state
+        reason = self.inhibited or self.machine.reason
+        signature = (state, reason)
+        if signature != self.previous_status:
+            self.log(f'State: {state}. {reason}')
+            self.previous_status = signature
+        if not self.state_path:
+            return
+        status = {'pid': os.getpid(), 'mode': 'dry-run' if self.dry_run else 'automatic',
+                  'updated_at': time.time(), 'state': state, 'sensor': self.health,
+                  'signal_units': 'Classic connection RSSI (relative range, not dBm)',
+                  'raw_rssi': self.machine.raw, 'median_rssi': self.machine.filtered,
+                  'reading_age_seconds': None if self.machine.last_sample_at is None else
+                      round((milliseconds() - self.machine.last_sample_at) / 1000, 1),
+                  'reason': reason, 'sensor_reason': self.sensor_reason, 'counts': self.counts}
         try:
-            self.presence.start()
-        except MonitorError as error:
-            print(f"ERROR: {error}", file=sys.stderr)
-            return 1
-
-        if self.probe:
-            print("Bluetooth RSSI probe active for 20 seconds; it cannot lock the screen.", flush=True)
-            GLib.timeout_add_seconds(20, self._finish_probe)
-            self.loop.run()
-            return 1 if self.fatal else 0
-
-        self.system_bus.signal_subscribe(
-            "org.freedesktop.login1",
-            "org.freedesktop.login1.Manager",
-            "PrepareForSleep",
-            "/org/freedesktop/login1",
-            None,
-            Gio.DBusSignalFlags.NONE,
-            self._prepare_for_sleep,
-        )
-        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self._pause)
-        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self._resume)
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, self._shutdown)
-
-        self._write_state("WAITING_FOR_NEAR", self._description("WAITING_FOR_NEAR"))
-        print("Monitor active: waiting for stable nearby Bluetooth RSSI readings before arming.", flush=True)
-        GLib.timeout_add_seconds(self.config["POLL_SECONDS"], self._tick)
-        self.loop.run()
-        self.presence.stop()
-        return 1 if self.fatal else 0
-
-    def _finish_probe(self):
-        if self.probe_samples:
-            samples = sorted(self.probe_samples)
-            median = samples[len(samples) // 2]
-            print(f"Probe summary: {len(samples)} RSSI readings; median {median} dBm.", flush=True)
-        else:
-            print("Probe summary: no RSSI readings received. Confirm the phone is paired in Ubuntu Bluetooth settings, Bluetooth is on, and it is advertising/discoverable.", flush=True)
-        idle = self._idle_milliseconds()
-        if idle is not None:
-            print(f"GNOME idle: {idle / 1000:.1f}s", flush=True)
-        self.loop.quit()
-        self.presence.stop()
-        return GLib.SOURCE_REMOVE
+            temporary = str(self.state_path) + '.tmp'
+            with open(temporary, 'w', encoding='utf-8') as output:
+                json.dump(status, output)
+                output.write('\n')
+            os.replace(temporary, self.state_path)
+        except OSError:
+            self.log('WARN: unable to write private runtime status.')
 
     def _tick(self):
-        if self.paused or self.sleeping:
-            return GLib.SOURCE_CONTINUE
-
         now = time.monotonic()
-        if now - self.last_tick > 30:
-            self.machine.reset()
-            self._log("Wake or scheduler gap detected; waiting for fresh near readings before re-arming.")
-        self.last_tick = now
-
-        result = self.machine.tick(time.monotonic() * 1000, False)
-        if result["state"] == "AWAY_WAITING_FOR_IDLE":
-            idle_ms = self._idle_milliseconds()
-            if idle_ms is not None:
-                result = self.machine.tick(
-                    time.monotonic() * 1000,
-                    idle_ms >= self.config["IDLE_AFTER_SECONDS"] * 1000,
-                )
-
-        self._set_state(result["state"])
-        if result["should_lock"]:
-            self._log("Phone stayed away and GNOME reports idle; requesting screen lock.")
-            if lock_session(self.config["LOCK_CMD"]):
-                self._log("Screen lock command completed. Phone return will re-arm; it will not unlock.")
-                self._set_state("LOCKED_AWAY")
-            else:
-                self.machine.lock_failed(time.monotonic() * 1000)
-                self._write_state("LOCK_FAILED", self._description("LOCK_FAILED"))
-                self._set_state("LOCK_FAILED")
-                self._log("ERROR: GNOME lock methods failed. Test `loginctl lock-session` from this session and check the journal.")
+        offset = sleep_offset()
+        if now - self.last_tick > 15 or abs(offset - self.sleep_delta) > 2:
+            self.invalidate('Suspend or scheduler gap detected; fresh arming required.')
+        self.last_tick, self.sleep_delta = now, offset
+        if self.paused or self.sleeping:
+            if self.worker.dirty:
+                self.worker.submit(lambda _: None, measure=False)
+        elif now >= self.next_sample:
+            if self.worker.submit(self._received):
+                self.next_sample = now + self.config['POLL_SECONDS']
+        self.machine.tick(milliseconds(), False)
+        self._status()
         return GLib.SOURCE_CONTINUE
+
+    def _shutdown(self):
+        self.stopping = True
+        self.worker.invalidate()
+        self.loop.quit()
+        return GLib.SOURCE_CONTINUE
+
+    def start(self):
+        def subscribe(sender, iface, signal_name, path, callback, arg0=None):
+            self.subscriptions.append(self.system_bus.signal_subscribe(sender, iface, signal_name,
+                path, arg0, Gio.DBusSignalFlags.NONE, callback))
+        subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Manager', 'PrepareForSleep',
+                  '/org/freedesktop/login1', self._prepare_for_sleep)
+        subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+                  '/org/freedesktop/DBus', self._bluez_changed, BLUEZ)
+        subscribe(BLUEZ, PROPERTIES, 'PropertiesChanged', None, self._bluez_changed)
+        subscribe(BLUEZ, OBJECT_MANAGER, 'InterfacesRemoved', '/', self._bluez_changed)
+        for sig, callback in ((signal.SIGUSR1, self._pause), (signal.SIGUSR2, self._resume),
+                              (signal.SIGTERM, self._shutdown), (signal.SIGINT, self._shutdown),
+                              (signal.SIGHUP, self._shutdown)):
+            self.sources.append(GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, callback))
+        self.sources.append(GLib.timeout_add_seconds(1, self._tick))
+        if self.duration:
+            self.sources.append(GLib.timeout_add_seconds(self.duration, self._shutdown))
+        self.log('Dry run: production decisions, locking disabled.' if self.dry_run else 'Automatic locking active; waiting for fresh nearby readings.')
+        self._tick()
+        try:
+            self.loop.run()
+        finally:
+            for subscription in self.subscriptions:
+                self.system_bus.signal_unsubscribe(subscription)
+            for source in self.sources:
+                GLib.source_remove(source)
+            self.worker.close()
+            self.machine.unknown('Monitor stopped; no automatic locking.')
+            self.inhibited = ''
+            self.health = 'unknown'
+            self._status()
+        self.log(f'Run summary: elapsed={time.monotonic() - self.started:.1f}s; ' + json.dumps(self.counts, sort_keys=True))
+        return 0 if self.counts['measured'] else 1
+
+
+def doctor(config):
+    """A connection sample and desktop checks; never invokes a lock method."""
+    print('Doctor: no lock requests; device identifiers are redacted.', flush=True)
+    problem = lock_settings_problem()
+    if problem:
+        print('ERROR: ' + problem)
+    desktop = Desktop(Gio.bus_get_sync(Gio.BusType.SESSION, None))
+    loop = GLib.MainLoop()
+    results = {}
+
+    def record(key, value):
+        results[key] = value
+        if len(results) == 2:
+            loop.quit()
+    desktop.idle(lambda value: record('idle', value))
+    desktop.active(lambda value: record('active', value))
+    loop.run()
+    print('GNOME idle API: ' + ('available (milliseconds)' if results['idle'] is not None else 'unavailable'))
+    print('GNOME lock-state API: ' + ('available' if results['active'] is not None else 'unavailable'))
+    sensor = ConnectionSensor(BluezTarget(Gio.bus_get_sync(Gio.BusType.SYSTEM, None), config['PHONE_ADDRESS']))
+    try:
+        sample = sensor.sample()
+        if sample.kind == 'measured':
+            try:
+                sensor._healthy()
+            except (SensorError, OSError):
+                sample = Sample('unknown', 'Local controller health read failed; absence detection is not ready on this kernel/controller.')
+    finally:
+        sensor.close()
+    print(f'Bluetooth: {sample.kind}; {sample.reason}')
+    if sample.rssi is not None:
+        print(f'Connection RSSI: {sample.rssi} (Classic relative range, not dBm). Zero is valid.')
+    ready = not problem and None not in results.values() and sample.kind == 'measured'
+    print('Diagnostic succeeded; background and departure tests are still required.' if ready else
+          'NOT READY: bring the paired phone nearby with Bluetooth on, resolve diagnostics, then retry.')
+    return 0 if ready else 1
 
 
 def main():
-    config_path = os.path.join(os.path.expanduser("~"), ".config", "dynamic_lock", "config")
-    state_path = None
-    probe = False
-    args = sys.argv[1:]
-    index = 0
-    while index < len(args):
-        if args[index] == "--config" and index + 1 < len(args):
-            config_path = args[index + 1]
-            index += 2
-        elif args[index] == "--state" and index + 1 < len(args):
-            state_path = args[index + 1]
-            index += 2
-        elif args[index] == "--probe":
-            probe = True
-            index += 1
-        else:
-            print(f"ERROR: unknown monitor option {args[index]}", file=sys.stderr)
-            return 2
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', default=str(Path.home() / '.config/dynamic_lock/config'))
+    parser.add_argument('--state')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--doctor', action='store_true')
+    modes.add_argument('--dry-run', action='store_true')
+    modes.add_argument('--probe', action='store_true')
+    modes.add_argument('--check-config', action='store_true')
+    parser.add_argument('--duration', type=int, default=0, help='dry-run duration in seconds (0 = until interrupted)')
+    args = parser.parse_args()
+    if args.duration < 0 or args.duration > 86400 or (args.duration and not (args.dry_run or args.probe)):
+        parser.error('--duration requires --dry-run or --probe and must be 0..86400 seconds')
+    os.umask(0o077)
     try:
-        config = read_config(config_path)
-        monitor = Monitor(config, state_path=state_path, probe=probe)
-        return monitor.start()
-    except (MonitorError, GLib.Error, OSError) as error:
-        print(f"ERROR: monitor startup failed: {error}", file=sys.stderr)
-        return 1
+        config = read_config(args.config, require_phone=not args.check_config)
+        if args.check_config:
+            print('Configuration syntax and permissions valid. No hardware check performed.')
+            return 0
+        runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'dynamic-lock'
+        runtime.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if runtime.stat().st_uid != os.getuid() or runtime.stat().st_mode & 0o077:
+            raise ConfigError('Runtime directory must belong to you with mode 700.')
+        with open(runtime / 'monitor.lock', 'a', encoding='ascii') as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConfigError('Another monitor or diagnostic is running. Stop it or use --disable before a new probe.') from None
+            if args.doctor:
+                return doctor(config)
+            monitor = Monitor(config, state_path=args.state or runtime / 'state',
+                              dry_run=args.dry_run or args.probe,
+                              duration=args.duration or (30 if args.probe else 0))
+            return monitor.start()
+    except ConfigError as error:
+        print('ERROR: ' + str(error), file=sys.stderr)
+    except (GLib.Error, OSError):
+        print('ERROR: cannot access runtime directory or desktop/system bus. Run from your GNOME user session and check --doctor.', file=sys.stderr)
+    return 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

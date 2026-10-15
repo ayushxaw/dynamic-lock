@@ -204,14 +204,17 @@ class ConnectionSensor:
     def _connection_timeout(self):
         # A remote timeout is only evidence with a fresh BlueZ AND HCI health check.
         self._healthy()
-        return Sample("absent", "Remote connection timed out; local controller responded.")
+        return Sample("absent", "Remote page/connection timed out; local controller responded.")
 
     def sample(self):
         try:
             target = self.target_provider()
             if target != self.target:
+                replacing = self.target is not None
                 self.close()
                 self.target = target
+                if replacing:
+                    return Sample('unknown', 'Bluetooth adapter identity changed; fresh nearby arming required.')
             if self.link is not None:
                 try:
                     self._ping()
@@ -222,7 +225,9 @@ class ConnectionSensor:
                 try:
                     self._connect()
                 except (TimeoutError, OSError) as error:
-                    if isinstance(error, TimeoutError) or error.errno == errno.ETIMEDOUT:
+                    # Linux bt_to_errno maps HCI Page Timeout (0x04) to
+                    # EHOSTDOWN, not ETIMEDOUT. Refusals remain UNKNOWN.
+                    if isinstance(error, TimeoutError) or error.errno in (errno.ETIMEDOUT, errno.EHOSTDOWN):
                         return self._connection_timeout()
                     raise
                 self._ping()

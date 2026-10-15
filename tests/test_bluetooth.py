@@ -2,6 +2,7 @@ import errno
 import socket
 import struct
 import unittest
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from dynamic_lock_bluetooth import (
@@ -80,6 +81,17 @@ class SensorTests(unittest.TestCase):
         self.sensor._healthy.side_effect = SensorError('Local controller unavailable.')
         self.assertEqual(self.sensor.sample().kind, 'unknown')
 
+    def test_linux_page_timeout_is_absence_only_with_local_health(self):
+        self.sensor._connect.side_effect = OSError(errno.EHOSTDOWN, 'redacted')
+        self.assertEqual(self.sensor.sample().kind, 'absent')
+        self.sensor._healthy.side_effect = SensorError('Adapter unavailable.')
+        self.assertEqual(self.sensor.sample().kind, 'unknown')
+
+    def test_unknown_network_errors_are_not_remote_timeout_evidence(self):
+        for code in (errno.ENETDOWN, errno.EHOSTUNREACH, errno.EBUSY, errno.EIO):
+            self.sensor._connect.side_effect = OSError(code, 'redacted')
+            self.assertEqual(self.sensor.sample().kind, 'unknown')
+
     def test_refusal_permission_and_service_timeout_are_unknown(self):
         for error in (OSError(errno.ECONNREFUSED, 'private'), PermissionError('private')):
             self.sensor._connect.side_effect = error
@@ -144,6 +156,26 @@ class SensorTests(unittest.TestCase):
         objects['/phone']['org.bluez.Device1']['Paired'] = False
         with self.assertRaises(SensorError):
             select_target(objects, TARGET.address)
+
+    def test_adapter_replacement_requires_new_arming_even_without_dbus_signal(self):
+        self.sensor.target = TARGET
+        self.sensor.target_provider = lambda: replace(TARGET, index=3, adapter_path='/org/bluez/hci3')
+        self.assertEqual(self.sensor.sample().kind, 'unknown')
+        self.sensor._connect.assert_not_called()
+        self.assertEqual(self.sensor.sample().kind, 'measured')
+
+    def test_hci_connection_info_checks_peer_and_handle(self):
+        sensor = ConnectionSensor(lambda: TARGET)
+        sensor.target = TARGET
+        peer = bytes.fromhex(TARGET.address.replace(':', ''))[::-1]
+        def reply(_fd, _request, buffer, _mutate):
+            buffer[8:] = struct.pack('=H6sBBHI', 7, peer, 1, 1, 1, 0)
+        with patch('dynamic_lock_bluetooth.fcntl.ioctl', side_effect=reply):
+            self.assertEqual(sensor._handle(Mock()), 7)
+        def wrong_peer(_fd, _request, buffer, _mutate):
+            buffer[8:] = struct.pack('=H6sBBHI', 7, b'\0' * 6, 1, 1, 1, 0)
+        with patch('dynamic_lock_bluetooth.fcntl.ioctl', side_effect=wrong_peer), self.assertRaises(SensorError):
+            sensor._handle(Mock())
 
 
 if __name__ == '__main__':

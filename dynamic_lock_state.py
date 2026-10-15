@@ -146,6 +146,9 @@ class PresenceMachine:
             else:
                 self.state = 'AWAY_WAITING_FOR_IDLE'
                 self.reason = 'Departure confirmed; waiting for GNOME idle confirmation.'
+        elif self.away_since is not None and self.next_lock_retry_at > now_ms:
+            self.state = 'LOCK_FAILED'
+            self.reason = 'Lock retry delayed; fresh departure evidence is still required.'
         return {'state': self.state, 'should_lock': should_lock}
 
     def lock_succeeded(self):
