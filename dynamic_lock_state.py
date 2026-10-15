@@ -1,123 +1,162 @@
-"""Pure RSSI proximity state machine for the Dynamic Lock monitor."""
+"""Deterministic proximity decisions. Times are monotonic milliseconds.
+
+No clock, Bluetooth, desktop, or locking side effects live here. UNKNOWN is a
+loss of evidence, never evidence of departure. Thresholds are Classic RSSI.
+"""
+
+from collections import deque
+from statistics import median
 
 
 class PresenceMachine:
-    def __init__(
-        self,
-        *,
-        drop_db=10,
-        stale_seconds=15,
-        away_seconds=30,
-        return_seconds=5,
-        arm_samples=3,
-        history_limit=5,
-    ):
-        self.drop_db = drop_db
+    def __init__(self, *, near_threshold=-5, away_threshold=-10, stale_seconds=15,
+                 away_seconds=30, return_seconds=5, arm_seconds=10):
+        if away_threshold >= near_threshold:
+            raise ValueError('away threshold must be lower than near threshold')
+        self.near_threshold = near_threshold
+        self.away_threshold = away_threshold
         self.stale_ms = stale_seconds * 1000
         self.away_ms = away_seconds * 1000
         self.return_ms = return_seconds * 1000
-        self.arm_samples = arm_samples
-        self.history_limit = history_limit
+        self.arm_ms = arm_seconds * 1000
         self.reset()
 
-    def reset(self):
-        self.history = []
+    def reset(self, reason='Waiting for three fresh near readings spanning at least ten seconds.'):
+        self.history = deque(maxlen=3)
         self.last_sample_at = None
-        self.baseline = None
+        self.raw = self.filtered = None
         self.armed = False
-        self.away_since = None
-        self.return_since = None
-        self.locked_once = False
+        self.near_since = self.return_since = self.away_since = None
+        self.near_count = self.away_count = 0
+        self.away_kind = None
+        self.locked_once = self.lock_in_flight = False
         self.lock_failures = 0
-        self.next_lock_retry_at = None
-        self.state = "WAITING_FOR_NEAR"
+        self.next_lock_retry_at = 0
+        self.state = 'WAITING_FOR_NEAR'
+        self.reason = reason
+        self.kind = 'unknown'
+
+    def unknown(self, reason):
+        self.reset(reason)
+        self.state = 'UNKNOWN'
+
+    def _cancel_away(self):
+        self.away_since = None
+        self.away_count = 0
+        self.away_kind = None
+        self.next_lock_retry_at = 0
+        self.lock_failures = 0
 
     def observe(self, rssi, now_ms):
-        if not isinstance(rssi, int) or rssi < -127 or rssi > 20:
-            return self.state
+        return self.accept('measured', now_ms, rssi)
 
+    def accept(self, kind, now_ms, rssi=None, reason=''):
+        if kind not in ('measured', 'absent') or (kind == 'measured' and
+                (type(rssi) is not int or not -127 <= rssi <= 126)):
+            self.unknown(reason or 'No usable connection measurement; fresh arming required.')
+            return self.state
+        if self.last_sample_at is not None:
+            gap = now_ms - self.last_sample_at
+            if gap <= 0:
+                self.unknown('Duplicate or out-of-order reading; fresh arming required.')
+                return self.state
+            if gap > self.stale_ms:
+                self.unknown('Readings expired; fresh arming required.')
         self.last_sample_at = now_ms
-        self.history.append(rssi)
-        self.history = self.history[-self.history_limit :]
-        smooth = self._median(self.history)
+        self.kind = kind
+        self.raw = rssi if kind == 'measured' else None
+        if kind == 'absent':
+            self.history.clear()
+            self.filtered = None
+            classification = 'away'
+        else:
+            self.history.append((now_ms, rssi))
+            while self.history and now_ms - self.history[0][0] > self.stale_ms:
+                self.history.popleft()
+            self.filtered = median(value for _, value in self.history) if len(self.history) == 3 else None
+            # A single non-away reading immediately cancels pending departure,
+            # even when the median still reflects earlier weak readings.
+            classification = 'band'
+            if rssi >= self.near_threshold:
+                classification = 'near' if self.filtered is not None and self.filtered >= self.near_threshold else 'warming'
+            elif rssi <= self.away_threshold and self.filtered is not None and self.filtered <= self.away_threshold:
+                classification = 'away'
 
         if not self.armed:
-            if len(self.history) >= self.arm_samples:
-                self.armed = True
-                self.baseline = smooth
-                self.state = "NEAR_ARMED"
+            if classification in ('near', 'warming'):
+                if self.near_since is None:
+                    self.near_since = now_ms
+                self.near_count = min(3, self.near_count + 1)
+                if (classification == 'near' and self.near_count >= 3
+                        and now_ms - self.near_since >= self.arm_ms):
+                    self.armed = True
+                    self.state = 'NEAR_ARMED'
+                    self.reason = 'Fresh nearby connection readings; ready to detect departure.'
+                    return self.state
+            else:
+                self.near_since = None
+                self.near_count = 0
+            self.state = 'WAITING_FOR_NEAR'
+            self.reason = 'Startup/recovery requires fresh near readings; absence alone cannot arm.'
             return self.state
 
-        away_threshold = self.baseline - self.drop_db
-        return_threshold = self.baseline - (self.drop_db / 2)
-        if smooth >= return_threshold:
-            if self.return_since is None:
-                self.return_since = now_ms
-            if now_ms - self.return_since >= self.return_ms:
-                self.away_since = None
-                self.return_since = None
-                self.locked_once = False
-                self.lock_failures = 0
-                self.next_lock_retry_at = None
-                self.state = "NEAR_ARMED"
-                if smooth > self.baseline:
-                    self.baseline = smooth
-            elif self.away_since is not None:
-                self.state = "RETURN_PENDING"
-        elif smooth <= away_threshold:
-            # A weak report clears an incomplete return and restarts grace.
-            if self.return_since is not None and self.away_since is not None:
-                self.away_since = now_ms
+        if classification == 'away':
             self.return_since = None
-            if self.away_since is None:
+            if self.away_since is None or self.away_kind != kind:
                 self.away_since = now_ms
-            self.state = "AWAY_PENDING"
-        # Readings in the hysteresis band keep the current state and timers.
+                self.away_count = 0
+                self.away_kind = kind
+            self.away_count = min(3, self.away_count + 1)
+            self.state = 'LOCKED_AWAY' if self.locked_once else 'AWAY_PENDING'
+            self.reason = 'Waiting for sustained weak signal or repeated healthy-controller connection timeouts.'
+        else:
+            self._cancel_away()
+            if classification == 'near':
+                if self.return_since is None:
+                    self.return_since = now_ms
+                if now_ms - self.return_since >= self.return_ms:
+                    self.locked_once = False
+                    self.state = 'NEAR_ARMED'
+                    self.reason = 'Nearby return confirmed; ready for the next departure.'
+                else:
+                    self.state = 'RETURN_PENDING'
+                    self.reason = 'Confirming a stable nearby return; no unlock is performed.'
+            else:
+                self.return_since = None
+                self.state = 'SIGNAL_UNCERTAIN'
+                self.reason = 'Signal between thresholds or warming filter; pending transitions cancelled.'
         return self.state
 
+    def eligible(self, now_ms):
+        if self.last_sample_at is not None and now_ms - self.last_sample_at > self.stale_ms:
+            self.unknown('Readings expired; no lock without fresh evidence.')
+        return (self.armed and self.away_since is not None and self.away_count >= 3
+                and self.last_sample_at - self.away_since >= self.away_ms
+                and not self.locked_once and not self.lock_in_flight
+                and now_ms >= self.next_lock_retry_at)
+
     def tick(self, now_ms, is_idle):
-        if not self.armed or self.last_sample_at is None:
-            self.state = "WAITING_FOR_NEAR"
-            return {"state": self.state, "should_lock": False}
+        should_lock = False
+        if self.eligible(now_ms):
+            if is_idle:
+                self.lock_in_flight = True
+                self.state = 'LOCK_REQUESTED'
+                self.reason = 'Fresh departure evidence and GNOME idle confirmation; lock requested.'
+                should_lock = True
+            else:
+                self.state = 'AWAY_WAITING_FOR_IDLE'
+                self.reason = 'Departure confirmed; waiting for GNOME idle confirmation.'
+        return {'state': self.state, 'should_lock': should_lock}
 
-        if now_ms - self.last_sample_at > self.stale_ms:
-            stale_at = self.last_sample_at + self.stale_ms
-            if self.return_since is not None:
-                self.return_since = None
-                self.away_since = now_ms
-            elif self.away_since is None or self.away_since < stale_at:
-                self.away_since = stale_at
-            self.state = "AWAY_PENDING"
-
-        if self.away_since is None:
-            return {"state": self.state, "should_lock": False}
-        if self.return_since is not None:
-            return {"state": "RETURN_PENDING", "should_lock": False}
-        if now_ms - self.away_since < self.away_ms:
-            self.state = "AWAY_PENDING"
-            return {"state": self.state, "should_lock": False}
-        if self.locked_once:
-            self.state = "LOCKED_AWAY"
-            return {"state": self.state, "should_lock": False}
-        if not is_idle:
-            self.state = "AWAY_WAITING_FOR_IDLE"
-            return {"state": self.state, "should_lock": False}
-        if self.next_lock_retry_at is not None and now_ms < self.next_lock_retry_at:
-            self.state = "LOCK_FAILED"
-            return {"state": self.state, "should_lock": False}
-
+    def lock_succeeded(self):
+        self.lock_in_flight = False
         self.locked_once = True
-        self.state = "LOCK_REQUESTED"
-        return {"state": self.state, "should_lock": True}
+        self.state = 'LOCKED_AWAY'
+        self.reason = 'Lock confirmed (or dry-run decision); waiting for a stable nearby return.'
 
     def lock_failed(self, now_ms):
-        self.locked_once = False
-        self.lock_failures += 1
-        backoff_ms = min(300000, 10000 * (2 ** (self.lock_failures - 1)))
-        self.next_lock_retry_at = now_ms + backoff_ms
-        self.state = "LOCK_FAILED"
-
-    @staticmethod
-    def _median(values):
-        ordered = sorted(values)
-        return ordered[len(ordered) // 2]
+        self.lock_in_flight = False
+        self.lock_failures = min(self.lock_failures + 1, 6)
+        self.next_lock_retry_at = now_ms + min(300000, 10000 * 2 ** (self.lock_failures - 1))
+        self.state = 'LOCK_FAILED'
+        self.reason = 'Lock could not be confirmed; retrying with bounded backoff while departure stays confirmed.'
