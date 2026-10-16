@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # User controls. Configuration is parsed as data by Python, never sourced.
 set -euo pipefail
+umask 077
 
 readonly VERSION="2.1.0"
 readonly SERVICE="dynamic_lock.service"

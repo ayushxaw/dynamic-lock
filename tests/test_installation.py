@@ -55,6 +55,13 @@ class InstallationTests(unittest.TestCase):
     def service_state(self):
         return json.loads((self.home / 'systemctl-state.json').read_text())
 
+    def test_service_preserves_instance_lock_inode_and_desktop_sockets(self):
+        unit = (REPO / 'dynamic_lock.service').read_text()
+        self.assertIn('RuntimeDirectoryPreserve=yes', unit)
+        self.assertIn('RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH', unit)
+        self.assertIn('NoNewPrivileges=true', unit)
+        self.assertNotIn('PrivateNetwork=true', unit)
+
     def test_install_upgrade_config_permissions_and_uninstall(self):
         self.run_cmd(str(REPO / 'install.sh'))
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)

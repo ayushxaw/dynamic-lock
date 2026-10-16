@@ -6,9 +6,9 @@ This file separates implemented behavior, automated evidence, and hardware evide
 
 Live Classic SDP connection plus native Linux HCI RSSI; explicit thresholds; bounded and fresh evidence; UNKNOWN fault handling; remote timeout classification with local controller checks; idle-gated GNOME lock confirmation; bounded retries; one radio worker; pause/resume and suspend invalidation; private config; staged installation; doctor and full dry-run; hardened user service.
 
-## Automated evidence — 2026-10-16
+## Automated evidence — 2026-10-17
 
-`/usr/bin/python3 -B -m unittest discover -s tests -q` currently passes **56 tests**. Coverage includes:
+`/usr/bin/python3 -B -m unittest discover -s tests -q` passes **57 tests**. Coverage includes:
 
 - SDP lengths, transaction IDs, response types, handle counts, continuation bounds, socket cleanup.
 - HCI event lengths, status, opcode, connection identity/handles, deadline, delayed/wrong-handle responses, zero RSSI and unavailable RSSI.
@@ -18,6 +18,7 @@ Live Classic SDP connection plus native Linux HCI RSSI; explicit thresholds; bou
 - GNOME idle milliseconds, missing/active idle gate, disabled locks, lock confirmation, bounded custom command, dry-run never invoking the actuator.
 - Three **simulated** departure/return cycles through the production monitor loop, including weak signal and remote absence, with decisions within 60 simulated seconds and fresh arming after a local fault.
 - Private config parsing/permissions and obsolete settings; install, upgrade, config preservation, activation refusal, controls, status freshness, logs, uninstall and running-process protection in an **isolated temporary home** with fake systemctl/journalctl.
+- Service configuration preserves the instance-lock inode across service stops/failures and permits the Unix/Bluetooth sockets needed for desktop integration.
 
 `bash -n dynamic_lock.sh install.sh uninstall.sh` passes.
 `systemd-analyze --user verify dynamic_lock.service` exits successfully; this host reports an unrelated warning in its installed `spice-vdagent.service`.
@@ -30,11 +31,16 @@ These tests do not establish physical range, phone background compatibility, act
 |---|---|
 | Initial feasibility, 2026-10-15 | Six validated SDP queries and six connection RSSI readings of `0` without administrator privileges during the audit. Establishes an available measurement path only. |
 | New implementation doctor, 2026-10-15 | One validated live connection RSSI reading of `0`; GNOME idle and lock-state APIs available. No lock was sent. |
-| Current pairing check, 2026-10-16 | Local BlueZ adapter powered, but the configured phone is no longer among its known devices. The program reports an actionable error and does not silently select another phone. |
+| Current pairing checks, 2026-10-16 and 2026-10-17 | Local BlueZ adapter powered, but the configured phone is no longer among its known devices. The program reports an actionable error and does not silently select another phone. |
 | 30-second full dry-run, 2026-10-16 | Three UNKNOWN observations, zero lock decisions, zero real locks; exited with nonzero diagnostic result because no measured samples were obtained. This is **not** a nearby stability pass. |
-| Hardened transient user-service check | Same security/resource properties as the installed unit, running `--dry-run`; service starts and accesses the system/session buses. Long fault-recovery observation is in progress. |
+| Hardened transient user-service check, 2026-10-16 | The no-lock fault-recovery run completed: 1,799.8 seconds in the monitor, 60 UNKNOWN observations, zero measured samples, zero lock decisions, zero real locks. Its diagnostic exit status was 1 because it obtained no measurements. This is **not** a nearby stability or range pass. |
+| Fault-recovery resource use | The journal reports 2.520 seconds CPU over 30 minutes 4.236 seconds wall time, and 20.8M memory peak. This measures the missing-pairing workload only; healthy-link resource use and battery impact remain untested. |
+| Local controller health under hardening, 2026-10-16 | An unprivileged HCI Read Local Version command succeeded with Unix/Bluetooth socket restrictions, read-only home/system, NoNewPrivileges, and private temporary storage. No phone connection or lock was requested. |
+| Pause/resume signals, 2026-10-16 | Repeated SIGUSR1/SIGUSR2 on the running dry-run changed status to PAUSED and back to UNKNOWN recovery without duplicate monitoring. Real suspend remains pending. |
+| Final installation, 2026-10-17 | Installed modules, CLI and user unit matched the worktree; existing private config contents were compared byte-for-byte and preserved. Automatic service stayed inactive/disabled. |
+| Live instance-lock lifecycle, 2026-10-17 | A foreground dry-run held the lock while a second service with the final hardening attempted startup. The service and a subsequent doctor were refused; the lock inode remained the same and the first dry-run completed its 12-second run without real locking. |
 
-The installed automatic service remains **disabled and inactive**. A separate temporary no-lock diagnostic may run during verification; it does not enable login startup.
+The installed automatic service remains **disabled and inactive**. The 30-minute temporary diagnostic has finished; it did not enable login startup. GitHub Actions also passed the preceding 56-test revision; subsequent commits rerun the checks on the PR.
 
 ## Hardware acceptance checklist
 

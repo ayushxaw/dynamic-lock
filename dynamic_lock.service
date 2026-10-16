@@ -17,6 +17,8 @@ UMask=0077
 
 RuntimeDirectory=dynamic-lock
 RuntimeDirectoryMode=0700
+# Keep the instance-lock inode when a competing service fails to start.
+RuntimeDirectoryPreserve=yes
 MemoryMax=80M
 CPUQuota=10%
 NoNewPrivileges=true
