@@ -29,7 +29,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     systemctl --user daemon-reload
 fi
 rm -f "$BIN_DIR/dynamic_lock.sh"
-for module in bluetooth config desktop monitor state; do
+for module in bluetooth config desktop gsconnect monitor state; do
     rm -f "$LIB_DIR/dynamic_lock_${module}.py"
     rm -f "$LIB_DIR/__pycache__/dynamic_lock_${module}."*.pyc
  done

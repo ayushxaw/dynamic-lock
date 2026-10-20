@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly SERVICE="dynamic_lock.service"
 readonly CONFIG_FILE="${HOME}/.config/dynamic_lock/config"
 readonly MONITOR="${HOME}/.local/lib/dynamic-lock/dynamic_lock_monitor.py"
@@ -13,8 +13,9 @@ readonly PYTHON="/usr/bin/python3"
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
-Dynamic Lock — Bluetooth connection proximity for Ubuntu GNOME
-  --doctor                  Check prerequisites and one connection reading; never locks
+Dynamic Lock — Bluetooth proximity lock for Ubuntu GNOME
+  --doctor                  Check prerequisites and phone connection; never locks
+  --setup                   Select a paired phone for the configured backend; save privately
   --dry-run [--duration N]   Run production decisions with locking disabled (Ctrl+C to stop)
   --probe [--duration N]     Same dry-run, defaults to 30 seconds
   --enable                  Check readiness, then enable and start automatic locking
@@ -49,7 +50,7 @@ esac
 case "$option" in
     --help|-h) usage ;;
     --version|-V) printf 'dynamic_lock %s\n' "$VERSION" ;;
-    --daemon|--doctor|--dry-run|--probe)
+    --daemon|--doctor|--dry-run|--probe|--setup)
         require_monitor
         if [[ "$option" == --daemon ]]; then
             exec "$PYTHON" -B "$MONITOR" --config "$CONFIG_FILE"
@@ -66,7 +67,7 @@ case "$option" in
             "$PYTHON" -B "$MONITOR" --config "$CONFIG_FILE" --doctor || fail 'Readiness check failed; automatic locking was not enabled.'
             systemctl --user enable --now "$SERVICE"
             active || fail 'Service did not start; inspect --logs.'
-            printf 'Automatic locking enabled. Fresh near readings are required before it can arm.\n'
+            printf 'Automatic locking enabled. Fresh presence checks are required before it can arm.\n'
         fi
         ;;
     --disable)
@@ -93,7 +94,7 @@ try:
     if not live or not 0 <= age <= 15:
         print('No fresh live monitor status. Historical readings are not readiness evidence.')
     else:
-        for key in ('mode', 'state', 'sensor', 'signal_units', 'raw_rssi', 'median_rssi', 'reading_age_seconds', 'reason', 'sensor_reason'):
+        for key in ('mode', 'backend', 'state', 'sensor', 'signal_units', 'raw_rssi', 'median_rssi', 'reading_age_seconds', 'reason', 'sensor_reason'):
             print(f'{key}: {state.get(key)}')
 except (OSError, ValueError, KeyError):
     print('Monitor state: unavailable; run --doctor or --dry-run.')

@@ -20,9 +20,10 @@ except (ImportError, ValueError):
     print('ERROR: system Python needs PyGObject with Gio/GLibUnix. On Ubuntu install python3-gi gir1.2-glib-2.0.', file=sys.stderr)
     raise SystemExit(1)
 
-from dynamic_lock_bluetooth import ConnectionSensor, Sample, SensorError, select_target
-from dynamic_lock_config import ConfigError, read_config
+from dynamic_lock_bluetooth import ConnectionSensor, Sample, SensorError, select_target, select_paired_phone
+from dynamic_lock_config import ConfigError, read_config, save_gsconnect_selection, save_bluetooth_selection
 from dynamic_lock_desktop import Desktop, lock_settings_problem
+from dynamic_lock_gsconnect import GSConnectSensor, select_phone, SERVICE as GSCONNECT, PATH as GSCONNECT_PATH, DEVICE as GSCONNECT_DEVICE, NM, NM_PATH
 from dynamic_lock_state import PresenceMachine
 
 BLUEZ = 'org.bluez'
@@ -60,7 +61,7 @@ class RadioWorker:
     """One outstanding job, no growing executor queue. Sockets stay on this thread."""
     def __init__(self, sensor):
         self.sensor = sensor
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='bluetooth')
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='presence')
         self.busy = False
         self.generation = 0
         self.worker_generation = -1
@@ -123,11 +124,19 @@ class Monitor:
         self.loop = GLib.MainLoop()
         self.system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         self.desktop = Desktop(Gio.bus_get_sync(Gio.BusType.SESSION, None))
-        self.target = BluezTarget(self.system_bus, config['PHONE_ADDRESS'])
-        self.worker = RadioWorker(ConnectionSensor(self.target))
+        self.backend = config.get('BACKEND', 'bluetooth')
+        if self.backend == 'gsconnect':
+            self.target = GSConnectSensor(self.desktop.bus, self.system_bus,
+                config.get('GSCONNECT_DEVICE_ID', ''), config.get('GSCONNECT_DEVICE_NAME', ''))
+            self.worker = RadioWorker(self.target)
+        else:
+            self.target = BluezTarget(self.system_bus, config['PHONE_ADDRESS'])
+            self.worker = RadioWorker(ConnectionSensor(self.target))
         self.machine = PresenceMachine(near_threshold=config['RSSI_NEAR_THRESHOLD'],
-            away_threshold=config['RSSI_AWAY_THRESHOLD'], stale_seconds=config['RSSI_STALE_SECONDS'],
-            away_seconds=config['AWAY_CONFIRM_SECONDS'], return_seconds=config['RETURN_CONFIRM_SECONDS'])
+            away_threshold=config['RSSI_AWAY_THRESHOLD'],
+            stale_seconds=config['STATUS_STALE_SECONDS'] if self.backend == 'gsconnect' else config['RSSI_STALE_SECONDS'],
+            away_seconds=config['AWAY_CONFIRM_SECONDS'], return_seconds=config['RETURN_CONFIRM_SECONDS'],
+            connection_mode=self.backend == 'gsconnect')
         self.paused = self.sleeping = self.stopping = self.desktop_busy = False
         self.last_tick = time.monotonic()
         self.sleep_delta = sleep_offset()
@@ -139,7 +148,7 @@ class Monitor:
         self.previous_status = None
         self.subscriptions = []
         self.sources = []
-        self.counts = {'measured': 0, 'absent': 0, 'unknown': 0, 'lock_decisions': 0, 'confirmed_locks': 0}
+        self.counts = dict.fromkeys(('measured', 'absent', 'connected', 'disconnected', 'unknown', 'lock_decisions', 'confirmed_locks'), 0)
         self.started = time.monotonic()
 
     @staticmethod
@@ -157,13 +166,13 @@ class Monitor:
     def _pause(self):
         if not self.paused:
             self.paused = True
-            self.invalidate('Paused by user; resume requires fresh nearby readings.')
+            self.invalidate('Paused by user; resume requires fresh presence checks.')
         return GLib.SOURCE_CONTINUE
 
     def _resume(self):
         if self.paused:
             self.paused = False
-            self.invalidate('Resumed; waiting for fresh nearby readings.')
+            self.invalidate('Resumed; waiting for fresh presence checks.')
         return GLib.SOURCE_CONTINUE
 
     def _prepare_for_sleep(self, _bus, _sender, _path, _iface, _signal, parameters):
@@ -191,6 +200,34 @@ class Monitor:
         elif target and name == 'InterfacesRemoved' and values[0] in (target.device_path, target.adapter_path):
             self.invalidate('Bluetooth adapter or pairing removed; fresh arming required.')
 
+    def _gsconnect_changed(self, _bus, _sender, path, _iface, name, parameters):
+        values = parameters.unpack()
+        if name == 'NameOwnerChanged':
+            if values[0] in (GSCONNECT, NM):
+                self.invalidate('GSConnect or NetworkManager restarted; fresh connected checks required.')
+            return
+        if name == 'InterfacesRemoved':
+            if values[0] == self.target.device_path:
+                self.invalidate('Selected GSConnect phone removed; check pairing.')
+            return
+        if name == 'InterfacesAdded':
+            self.worker.invalidate()
+            self.next_sample = 0
+            return
+        interface, changed, invalid = values
+        keys = set(changed) | set(invalid)
+        if path == NM_PATH and interface == NM and keys & {'State', 'NetworkingEnabled', 'ActiveConnections', 'PrimaryConnection', 'WirelessEnabled'}:
+            self.invalidate('Laptop network changed; fresh connected checks required.')
+        elif interface == GSCONNECT_DEVICE and (self.target.device_path is None or path == self.target.device_path):
+            if keys & {'Paired', 'Id'}:
+                self.invalidate('GSConnect pairing changed; fresh connected checks required.')
+            elif 'Connected' in keys:
+                # Cancel any pending asynchronous desktop request immediately,
+                # then validate this change with fresh service/network checks.
+                self.worker.invalidate()
+                self.health = 'unknown'
+                self.next_sample = 0
+
     def _received(self, sample):
         if sample is None or self.paused or self.sleeping or self.stopping:
             return
@@ -205,13 +242,14 @@ class Monitor:
         self.next_sample = now + delay if self.faults else max(self.next_sample, now)
         self.inhibited = sample.reason if sample.kind == 'unknown' else ''
         if self.dry_run:
-            self.log(f'Sample: {sample.kind}; connection RSSI={sample.rssi}; {sample.reason}')
+            signal = f'; connection RSSI={sample.rssi}' if self.backend == 'bluetooth' else ''
+            self.log(f'Sample: {sample.kind}{signal}; {sample.reason}')
         self._decide()
         self._status()
 
     def _guard(self, generation):
         return (generation == self.worker.generation and not self.stopping and not self.paused
-                and not self.sleeping and self.health in ('measured', 'absent')
+                and not self.sleeping and self.health in ('measured', 'absent', 'connected', 'disconnected')
                 and self.machine.last_sample_at is not None
                 and 0 <= milliseconds() - self.machine.last_sample_at <= 3000
                 and self.machine.away_since is not None)
@@ -253,7 +291,7 @@ class Monitor:
 
             def locked(success):
                 self.desktop_busy = False
-                if generation != self.worker.generation:
+                if generation != self.worker.generation or self.health == 'unknown' or self.paused or self.sleeping:
                     return
                 if success:
                     self.counts['confirmed_locks'] += 1
@@ -276,8 +314,10 @@ class Monitor:
         if not self.state_path:
             return
         status = {'pid': os.getpid(), 'mode': 'dry-run' if self.dry_run else 'automatic',
+                  'backend': self.backend,
                   'updated_at': time.time(), 'state': state, 'sensor': self.health,
-                  'signal_units': 'Classic connection RSSI (relative range, not dBm)',
+                  'signal_units': ('GSConnect connection (no distance measurement)' if self.backend == 'gsconnect' else
+                                   'Classic connection RSSI (relative range, not dBm)'),
                   'raw_rssi': self.machine.raw, 'median_rssi': self.machine.filtered,
                   'reading_age_seconds': None if self.machine.last_sample_at is None else
                       round((milliseconds() - self.machine.last_sample_at) / 1000, 1),
@@ -314,15 +354,26 @@ class Monitor:
         return GLib.SOURCE_CONTINUE
 
     def start(self):
-        def subscribe(sender, iface, signal_name, path, callback, arg0=None):
-            self.subscriptions.append(self.system_bus.signal_subscribe(sender, iface, signal_name,
-                path, arg0, Gio.DBusSignalFlags.NONE, callback))
+        def subscribe(sender, iface, signal_name, path, callback, arg0=None, bus=None):
+            bus = bus or self.system_bus
+            self.subscriptions.append((bus, bus.signal_subscribe(sender, iface, signal_name,
+                path, arg0, Gio.DBusSignalFlags.NONE, callback)))
         subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Manager', 'PrepareForSleep',
                   '/org/freedesktop/login1', self._prepare_for_sleep)
-        subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
-                  '/org/freedesktop/DBus', self._bluez_changed, BLUEZ)
-        subscribe(BLUEZ, PROPERTIES, 'PropertiesChanged', None, self._bluez_changed)
-        subscribe(BLUEZ, OBJECT_MANAGER, 'InterfacesRemoved', '/', self._bluez_changed)
+        if self.backend == 'gsconnect':
+            subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+                      '/org/freedesktop/DBus', self._gsconnect_changed, GSCONNECT, self.desktop.bus)
+            subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+                      '/org/freedesktop/DBus', self._gsconnect_changed, NM)
+            subscribe(GSCONNECT, PROPERTIES, 'PropertiesChanged', None, self._gsconnect_changed, bus=self.desktop.bus)
+            for signal_name in ('InterfacesAdded', 'InterfacesRemoved'):
+                subscribe(GSCONNECT, OBJECT_MANAGER, signal_name, GSCONNECT_PATH, self._gsconnect_changed, bus=self.desktop.bus)
+            subscribe(NM, PROPERTIES, 'PropertiesChanged', NM_PATH, self._gsconnect_changed)
+        else:
+            subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+                      '/org/freedesktop/DBus', self._bluez_changed, BLUEZ)
+            subscribe(BLUEZ, PROPERTIES, 'PropertiesChanged', None, self._bluez_changed)
+            subscribe(BLUEZ, OBJECT_MANAGER, 'InterfacesRemoved', '/', self._bluez_changed)
         for sig, callback in ((signal.SIGUSR1, self._pause), (signal.SIGUSR2, self._resume),
                               (signal.SIGTERM, self._shutdown), (signal.SIGINT, self._shutdown),
                               (signal.SIGHUP, self._shutdown)):
@@ -330,13 +381,13 @@ class Monitor:
         self.sources.append(GLib.timeout_add_seconds(1, self._tick))
         if self.duration:
             self.sources.append(GLib.timeout_add_seconds(self.duration, self._shutdown))
-        self.log('Dry run: production decisions, locking disabled.' if self.dry_run else 'Automatic locking active; waiting for fresh nearby readings.')
+        self.log(f'Backend: {self.backend}. ' + ('Dry run; locking disabled.' if self.dry_run else 'Automatic locking active; waiting for fresh presence checks.'))
         self._tick()
         try:
             self.loop.run()
         finally:
-            for subscription in self.subscriptions:
-                self.system_bus.signal_unsubscribe(subscription)
+            for bus, subscription in self.subscriptions:
+                bus.signal_unsubscribe(subscription)
             for source in self.sources:
                 GLib.source_remove(source)
             self.worker.close()
@@ -345,7 +396,7 @@ class Monitor:
             self.health = 'unknown'
             self._status()
         self.log(f'Run summary: elapsed={time.monotonic() - self.started:.1f}s; ' + json.dumps(self.counts, sort_keys=True))
-        return 0 if self.counts['measured'] else 1
+        return 0 if self.counts['measured'] or self.counts['connected'] else 1
 
 
 def doctor(config):
@@ -367,7 +418,10 @@ def doctor(config):
     loop.run()
     print('GNOME idle API: ' + ('available (milliseconds)' if results['idle'] is not None else 'unavailable'))
     print('GNOME lock-state API: ' + ('available' if results['active'] is not None else 'unavailable'))
-    sensor = ConnectionSensor(BluezTarget(Gio.bus_get_sync(Gio.BusType.SYSTEM, None), config['PHONE_ADDRESS']))
+    system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    backend = config['BACKEND']
+    sensor = (GSConnectSensor(desktop.bus, system_bus, config['GSCONNECT_DEVICE_ID'], config['GSCONNECT_DEVICE_NAME'])
+              if backend == 'gsconnect' else ConnectionSensor(BluezTarget(system_bus, config['PHONE_ADDRESS'])))
     try:
         sample = sensor.sample()
         if sample.kind == 'measured':
@@ -377,12 +431,13 @@ def doctor(config):
                 sample = Sample('unknown', 'Local controller health read failed; absence detection is not ready on this kernel/controller.')
     finally:
         sensor.close()
-    print(f'Bluetooth: {sample.kind}; {sample.reason}')
+    print(f'{backend}: {sample.kind}; {sample.reason}')
     if sample.rssi is not None:
         print(f'Connection RSSI: {sample.rssi} (Classic relative range, not dBm). Zero is valid.')
-    ready = not problem and None not in results.values() and sample.kind == 'measured'
+    ready = not problem and None not in results.values() and sample.kind in ('measured', 'connected')
     print('Diagnostic succeeded; background and departure tests are still required.' if ready else
-          'NOT READY: bring the paired phone nearby with Bluetooth on, resolve diagnostics, then retry.')
+          ('NOT READY: open KDE Connect on the paired phone, connect it to the laptop in GSConnect, then retry.' if backend == 'gsconnect' else
+           'NOT READY: bring the paired phone nearby with Bluetooth on, resolve diagnostics, then retry.'))
     return 0 if ready else 1
 
 
@@ -395,13 +450,14 @@ def main():
     modes.add_argument('--dry-run', action='store_true')
     modes.add_argument('--probe', action='store_true')
     modes.add_argument('--check-config', action='store_true')
+    modes.add_argument('--setup', action='store_true', help='select a paired phone for the configured backend and save its identity privately')
     parser.add_argument('--duration', type=int, default=0, help='dry-run duration in seconds (0 = until interrupted)')
     args = parser.parse_args()
     if args.duration < 0 or args.duration > 86400 or (args.duration and not (args.dry_run or args.probe)):
         parser.error('--duration requires --dry-run or --probe and must be 0..86400 seconds')
     os.umask(0o077)
     try:
-        config = read_config(args.config, require_phone=not args.check_config)
+        config = read_config(args.config, require_phone=not (args.check_config or args.setup))
         if args.check_config:
             print('Configuration syntax and permissions valid. No hardware check performed.')
             return 0
@@ -416,11 +472,27 @@ def main():
                 raise ConfigError('Another monitor or diagnostic is running. Stop it or use --disable before a new probe.') from None
             if args.doctor:
                 return doctor(config)
+            if args.setup:
+                if config['BACKEND'] == 'bluetooth':
+                    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+                    objects = bus.call_sync(BLUEZ, '/', OBJECT_MANAGER, 'GetManagedObjects', None, None,
+                        Gio.DBusCallFlags.NO_AUTO_START, 1500, None).unpack()[0]
+                    target = select_paired_phone(objects, config['PHONE_ADDRESS'])
+                    save_bluetooth_selection(args.config, target.address)
+                    print('Selected paired Bluetooth phone; address saved privately. Automatic locking remains disabled.')
+                    return 0
+                sensor = GSConnectSensor(Gio.bus_get_sync(Gio.BusType.SESSION, None), None)
+                objects = sensor._call(sensor.session_bus, GSCONNECT, GSCONNECT_PATH, OBJECT_MANAGER, 'GetManagedObjects')[0]
+                _, props = select_phone(objects, config['GSCONNECT_DEVICE_ID'], config['GSCONNECT_DEVICE_NAME'])
+                save_gsconnect_selection(args.config, props['Id'])
+                print('Selected paired GSConnect phone; identity saved privately. BACKEND=gsconnect. No locking enabled.')
+                print('Phone is connected.' if props['Connected'] else 'Phone is disconnected: open KDE Connect on the phone and connect to this laptop.')
+                return 0
             monitor = Monitor(config, state_path=args.state or runtime / 'state',
                               dry_run=args.dry_run or args.probe,
                               duration=args.duration or (30 if args.probe else 0))
             return monitor.start()
-    except ConfigError as error:
+    except (ConfigError, SensorError) as error:
         print('ERROR: ' + str(error), file=sys.stderr)
     except (GLib.Error, OSError):
         print('ERROR: cannot access runtime directory or desktop/system bus. Run from your GNOME user session and check --doctor.', file=sys.stderr)

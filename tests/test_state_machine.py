@@ -42,6 +42,8 @@ class PresenceMachineTests(unittest.TestCase):
 
     def test_zero_valid_unavailable_invalid(self):
         self.arm()
+        self.machine.observe(0, 12000)
+        self.assertEqual(self.machine.state, 'NEAR_ARMED')
         self.machine.observe(127, 15000)
         self.assertFalse(self.machine.armed)
 

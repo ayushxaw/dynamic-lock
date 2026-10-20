@@ -7,7 +7,7 @@ from dynamic_lock_config import SETTINGS
 from dynamic_lock_monitor import Monitor, RadioWorker
 
 
-CONFIG = {key: values[0] for key, values in SETTINGS.items()} | {'PHONE_ADDRESS': 'AA:BB:CC:DD:EE:FF', 'LOCK_CMD': ''}
+CONFIG = {key: values[0] for key, values in SETTINGS.items()} | {'BACKEND': 'bluetooth', 'PHONE_ADDRESS': 'AA:BB:CC:DD:EE:FF', 'LOCK_CMD': ''}
 
 
 class MonitorTests(unittest.TestCase):

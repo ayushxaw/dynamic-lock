@@ -12,7 +12,7 @@ for dependency in systemctl install; do
     command -v "$dependency" >/dev/null 2>&1 || fail "Required command missing: $dependency"
 done
 [[ -x /usr/bin/python3 ]] || fail 'Install system python3.'
-/usr/bin/python3 -c 'import gi, socket; from gi.repository import Gio, GLib, GLibUnix; assert hasattr(socket, "AF_BLUETOOTH")' >/dev/null 2>&1 || fail 'Install python3-gi and gir1.2-glib-2.0 with system Python on Ubuntu; Linux Bluetooth socket support is required.'
+/usr/bin/python3 -c 'import gi; from gi.repository import Gio, GLib, GLibUnix' >/dev/null 2>&1 || fail 'Install python3-gi and gir1.2-glib-2.0 with system Python on Ubuntu.'
 systemctl --user show-environment >/dev/null 2>&1 || fail 'Run this from your GNOME user session; the systemd user manager is unavailable.'
 
 if [[ -e "$SYSTEMD_DIR/dynamic_lock.service" ]]; then
@@ -32,7 +32,7 @@ PY
 
 install -d -m 755 "$BIN_DIR" "$LIB_DIR" "$SYSTEMD_DIR"
 install -m 755 "$SCRIPT_DIR/dynamic_lock.sh" "$BIN_DIR/dynamic_lock.sh"
-for module in bluetooth config desktop monitor state; do
+for module in bluetooth config desktop gsconnect monitor state; do
     install -m 644 "$SCRIPT_DIR/dynamic_lock_${module}.py" "$LIB_DIR/dynamic_lock_${module}.py"
 done
 rm -f "$LIB_DIR/dynamic_lock_monitor.js" "$LIB_DIR/dynamic_lock_state.js"
@@ -49,5 +49,5 @@ systemctl --user disable dynamic_lock.service
 printf 'Installed with automatic locking DISABLED, including on upgrades.\n'
 /usr/bin/python3 -B "$LIB_DIR/dynamic_lock_monitor.py" --check-config --config "$CONFIG_DIR/config" || fail 'Files installed, but configuration needs correction before use.'
 printf 'Edit %s/config, then run:\n' "$CONFIG_DIR"
-printf '  %s/dynamic_lock.sh --doctor\n  %s/dynamic_lock.sh --dry-run\n' "$BIN_DIR" "$BIN_DIR"
+printf '  %s/dynamic_lock.sh --setup\n  %s/dynamic_lock.sh --doctor\n  %s/dynamic_lock.sh --dry-run\n' "$BIN_DIR" "$BIN_DIR" "$BIN_DIR"
 printf 'After successful background/departure tests, activate with --enable.\n'

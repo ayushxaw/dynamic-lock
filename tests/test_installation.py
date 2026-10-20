@@ -122,4 +122,4 @@ class InstallationTests(unittest.TestCase):
         self.assertIn('No fresh live', self.run_cmd(str(self.cli), '--status'))
         self.run_cmd(str(self.cli), '--enable', 'extra', code=2)
         self.run_cmd(str(self.cli), '--unknown', code=2)
-        self.assertIn('2.1.0', self.run_cmd(str(self.cli), '--version'))
+        self.assertIn('2.2.0', self.run_cmd(str(self.cli), '--version'))

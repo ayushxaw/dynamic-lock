@@ -1,7 +1,8 @@
-"""Deterministic proximity decisions. Times are monotonic milliseconds.
+"""Deterministic presence decisions. Times are monotonic milliseconds.
 
 No clock, Bluetooth, desktop, or locking side effects live here. UNKNOWN is a
-loss of evidence, never evidence of departure. Thresholds are Classic RSSI.
+loss of evidence, never evidence of departure. Bluetooth thresholds are Classic
+RSSI; the optional connection mode accepts distinct connected/disconnected events.
 """
 
 from collections import deque
@@ -10,7 +11,7 @@ from statistics import median
 
 class PresenceMachine:
     def __init__(self, *, near_threshold=-5, away_threshold=-10, stale_seconds=15,
-                 away_seconds=30, return_seconds=5, arm_seconds=10):
+                 away_seconds=30, return_seconds=5, arm_seconds=10, connection_mode=False):
         if away_threshold >= near_threshold:
             raise ValueError('away threshold must be lower than near threshold')
         self.near_threshold = near_threshold
@@ -19,9 +20,10 @@ class PresenceMachine:
         self.away_ms = away_seconds * 1000
         self.return_ms = return_seconds * 1000
         self.arm_ms = arm_seconds * 1000
+        self.connection_mode = connection_mode
         self.reset()
 
-    def reset(self, reason='Waiting for three fresh near readings spanning at least ten seconds.'):
+    def reset(self, reason=None):
         self.history = deque(maxlen=3)
         self.last_sample_at = None
         self.raw = self.filtered = None
@@ -33,7 +35,8 @@ class PresenceMachine:
         self.lock_failures = 0
         self.next_lock_retry_at = 0
         self.state = 'WAITING_FOR_NEAR'
-        self.reason = reason
+        self.reason = reason or ('Waiting for three fresh connected checks spanning at least ten seconds.' if self.connection_mode else
+                                 'Waiting for three fresh near readings spanning at least ten seconds.')
         self.kind = 'unknown'
 
     def unknown(self, reason):
@@ -51,7 +54,8 @@ class PresenceMachine:
         return self.accept('measured', now_ms, rssi)
 
     def accept(self, kind, now_ms, rssi=None, reason=''):
-        if kind not in ('measured', 'absent') or (kind == 'measured' and
+        valid_kinds = ('connected', 'disconnected') if self.connection_mode else ('measured', 'absent')
+        if kind not in valid_kinds or (kind == 'measured' and
                 (type(rssi) is not int or not -127 <= rssi <= 126)):
             self.unknown(reason or 'No usable connection measurement; fresh arming required.')
             return self.state
@@ -65,7 +69,11 @@ class PresenceMachine:
         self.last_sample_at = now_ms
         self.kind = kind
         self.raw = rssi if kind == 'measured' else None
-        if kind == 'absent':
+        if self.connection_mode:
+            self.history.clear()
+            self.filtered = self.raw = None
+            classification = 'near' if kind == 'connected' else 'away'
+        elif kind == 'absent':
             self.history.clear()
             self.filtered = None
             classification = 'away'
@@ -91,13 +99,15 @@ class PresenceMachine:
                         and now_ms - self.near_since >= self.arm_ms):
                     self.armed = True
                     self.state = 'NEAR_ARMED'
-                    self.reason = 'Fresh nearby connection readings; ready to detect departure.'
+                    self.reason = ('GSConnect connection confirmed; ready to detect a disconnect.' if self.connection_mode else
+                                   'Fresh nearby connection readings; ready to detect departure.')
                     return self.state
             else:
                 self.near_since = None
                 self.near_count = 0
             self.state = 'WAITING_FOR_NEAR'
-            self.reason = 'Startup/recovery requires fresh near readings; absence alone cannot arm.'
+            self.reason = ('Startup/recovery requires fresh connected checks; disconnection alone cannot arm.' if self.connection_mode else
+                           'Startup/recovery requires fresh near readings; absence alone cannot arm.')
             return self.state
 
         if classification == 'away':
@@ -108,19 +118,25 @@ class PresenceMachine:
                 self.away_kind = kind
             self.away_count = min(3, self.away_count + 1)
             self.state = 'LOCKED_AWAY' if self.locked_once else 'AWAY_PENDING'
-            self.reason = 'Waiting for sustained weak signal or repeated healthy-controller connection timeouts.'
+            self.reason = ('Confirming a sustained phone disconnect while the local network remains healthy.' if self.connection_mode else
+                           'Waiting for sustained weak signal or repeated healthy-controller connection timeouts.')
         else:
             self._cancel_away()
             if classification == 'near':
+                if self.state == 'NEAR_ARMED' and not self.locked_once:
+                    self.return_since = None
+                    return self.state
                 if self.return_since is None:
                     self.return_since = now_ms
                 if now_ms - self.return_since >= self.return_ms:
                     self.locked_once = False
                     self.state = 'NEAR_ARMED'
-                    self.reason = 'Nearby return confirmed; ready for the next departure.'
+                    self.reason = ('GSConnect reconnection confirmed; ready for the next disconnect.' if self.connection_mode else
+                                   'Nearby return confirmed; ready for the next departure.')
                 else:
                     self.state = 'RETURN_PENDING'
-                    self.reason = 'Confirming a stable nearby return; no unlock is performed.'
+                    self.reason = ('Confirming a stable GSConnect reconnection; no unlock is performed.' if self.connection_mode else
+                                   'Confirming a stable nearby return; no unlock is performed.')
             else:
                 self.return_since = None
                 self.state = 'SIGNAL_UNCERTAIN'
@@ -155,7 +171,8 @@ class PresenceMachine:
         self.lock_in_flight = False
         self.locked_once = True
         self.state = 'LOCKED_AWAY'
-        self.reason = 'Lock confirmed (or dry-run decision); waiting for a stable nearby return.'
+        self.reason = ('Lock confirmed (or dry-run decision); waiting for a stable GSConnect reconnection.' if self.connection_mode else
+                       'Lock confirmed (or dry-run decision); waiting for a stable nearby return.')
 
     def lock_failed(self, now_ms):
         self.lock_in_flight = False

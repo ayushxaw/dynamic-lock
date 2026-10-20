@@ -1,5 +1,5 @@
 [Unit]
-Description=Dynamic Lock — lock GNOME when paired phone is out of Bluetooth range
+Description=Dynamic Lock — lock GNOME after sustained Bluetooth departure
 After=graphical-session.target
 PartOf=graphical-session.target
 StartLimitIntervalSec=300
