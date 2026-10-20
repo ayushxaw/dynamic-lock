@@ -29,7 +29,7 @@ class Target:
 
 @dataclass(frozen=True)
 class Sample:
-    kind: str  # measured, absent, unknown
+    kind: str  # measured/absent (Bluetooth), connected/disconnected (GSConnect), unknown
     reason: str
     rssi: int | None = None
 
@@ -57,6 +57,22 @@ def select_target(objects, address):
     if not match or not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", local):
         raise SensorError("BlueZ returned an unsupported adapter identity.")
     return Target(address, local, int(match[1]), path, adapter_path)
+
+
+def select_paired_phone(objects, preferred_address=""):
+    """Explicit setup selects a configured target or one unambiguous paired phone."""
+    if preferred_address:
+        return select_target(objects, preferred_address)
+    candidates = []
+    for interfaces in objects.values():
+        props = interfaces.get('org.bluez.Device1', {})
+        device_class = props.get('Class', 0)
+        phone = props.get('Icon') == 'phone' or (type(device_class) is int and (device_class >> 8) & 31 == 2)
+        if props.get('Paired') is True and phone:
+            candidates.append(props.get('Address', ''))
+    if len(candidates) != 1:
+        raise SensorError('Pair your phone in Ubuntu Settings → Bluetooth. If several phones are paired, set PHONE_ADDRESS in the private config before --setup.')
+    return select_target(objects, candidates[0])
 
 
 def validate_sdp(packet, transaction):
@@ -108,6 +124,10 @@ class ConnectionSensor:
     READ_RSSI = 0x1405
     READ_VERSION = 0x1001
     HCIGETCONNINFO = 0x800448D5  # Linux _IOR('H', 213, int), asm-generic ABI.
+    SOL_BLUETOOTH = 274
+    BT_SECURITY = 4
+    BT_SECURITY_MEDIUM = 2
+    LINK_SECURITY_FLAGS = 0x0006  # HCI_LM_AUTH | HCI_LM_ENCRYPT
 
     def __init__(self, target_provider):
         self.target_provider = target_provider
@@ -124,6 +144,10 @@ class ConnectionSensor:
         link = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
         try:
             link.settimeout(self.CONNECT_TIMEOUT)
+            # Reuse the existing bond and require encryption for this channel.
+            # Do not silently fall back to an unauthenticated address-only link.
+            link.setsockopt(self.SOL_BLUETOOTH, self.BT_SECURITY,
+                            struct.pack('BB', self.BT_SECURITY_MEDIUM, 0))
             link.bind((self.target.local_address, 0))
             link.connect((self.target.address, 1))  # SDP PSM; no audio/network profile.
         except BaseException:
@@ -182,6 +206,9 @@ class ConnectionSensor:
         handle = struct.unpack_from("=H", request, 8)[0]
         if handle > 0x0EFF or request[10:16] != address or request[16] != 1:
             raise SensorError("Controller returned a different connection; locking inhibited.")
+        mode = struct.unpack_from('=I', request, 20)[0]
+        if mode & self.LINK_SECURITY_FLAGS != self.LINK_SECURITY_FLAGS:
+            raise SensorError('Phone link is not authenticated and encrypted; check the Bluetooth pairing. Locking inhibited.')
         return handle
 
     def _rssi(self):
@@ -207,6 +234,8 @@ class ConnectionSensor:
         return Sample("absent", "Remote page/connection timed out; local controller responded.")
 
     def sample(self):
+        if not all(hasattr(socket, name) for name in ('AF_BLUETOOTH', 'BTPROTO_L2CAP', 'BTPROTO_HCI', 'HCI_FILTER')):
+            return Sample('unknown', 'This Python/kernel build lacks Linux Classic Bluetooth socket support; unsupported configuration.')
         try:
             target = self.target_provider()
             if target != self.target:
@@ -234,7 +263,7 @@ class ConnectionSensor:
             rssi = self._rssi()
             if self.target_provider() != self.target:
                 raise SensorError("Bluetooth adapter or pairing changed during measurement.")
-            return Sample("measured", "Live connection RSSI received.", rssi)
+            return Sample("measured", "Encrypted paired connection RSSI received.", rssi)
         except SensorError as error:
             self.close()
             return Sample("unknown", str(error))
@@ -244,6 +273,8 @@ class ConnectionSensor:
                 reason = "Bluetooth access denied. This kernel/session is unsupported without additional permissions; do not run as root."
             elif error.errno == errno.ECONNREFUSED:
                 reason = "Phone refused SDP connection; check pairing. Refusal is not departure."
+            elif error.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.ENOPROTOOPT, errno.EOPNOTSUPP):
+                reason = 'Required Bluetooth socket/security support is unavailable on this kernel/controller; this configuration is unsupported.'
             elif isinstance(error, TimeoutError):
                 reason = "SDP or controller reply timed out; no valid proximity measurement."
             else:

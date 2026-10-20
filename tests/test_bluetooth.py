@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from dynamic_lock_bluetooth import (
     ConnectionSensor, Sample, SensorError, Target, command_response,
-    select_target, validate_sdp,
+    select_target, select_paired_phone, validate_sdp,
 )
 
 
@@ -169,14 +169,72 @@ class SensorTests(unittest.TestCase):
         sensor.target = TARGET
         peer = bytes.fromhex(TARGET.address.replace(':', ''))[::-1]
         def reply(_fd, _request, buffer, _mutate):
-            buffer[8:] = struct.pack('=H6sBBHI', 7, peer, 1, 1, 1, 0)
+            buffer[8:] = struct.pack('=H6sBBHI', 7, peer, 1, 1, 1, 6)
         with patch('dynamic_lock_bluetooth.fcntl.ioctl', side_effect=reply):
             self.assertEqual(sensor._handle(Mock()), 7)
         def wrong_peer(_fd, _request, buffer, _mutate):
-            buffer[8:] = struct.pack('=H6sBBHI', 7, b'\0' * 6, 1, 1, 1, 0)
+            buffer[8:] = struct.pack('=H6sBBHI', 7, b'\0' * 6, 1, 1, 1, 6)
         with patch('dynamic_lock_bluetooth.fcntl.ioctl', side_effect=wrong_peer), self.assertRaises(SensorError):
             sensor._handle(Mock())
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BluetoothSetupAndSecurityTests(unittest.TestCase):
+    def objects(self):
+        return {'/phone': {'org.bluez.Device1': {'Address': TARGET.address, 'Paired': True, 'Icon': 'phone', 'Adapter': TARGET.adapter_path}},
+                TARGET.adapter_path: {'org.bluez.Adapter1': {'Address': TARGET.local_address, 'Powered': True}},
+                '/headset': {'org.bluez.Device1': {'Address': '11:22:33:44:55:66', 'Paired': True, 'Icon': 'audio-headset', 'Adapter': TARGET.adapter_path}}}
+
+    def test_setup_selects_only_paired_phone_or_explicit_target(self):
+        objects = self.objects()
+        self.assertEqual(select_paired_phone(objects), TARGET)
+        self.assertEqual(select_paired_phone(objects, TARGET.address), TARGET)
+        objects['/second'] = {'org.bluez.Device1': {'Address': '22:33:44:55:66:77', 'Paired': True, 'Class': 0x0200, 'Adapter': TARGET.adapter_path}}
+        with self.assertRaises(SensorError):
+            select_paired_phone(objects)
+        self.assertEqual(select_paired_phone(objects, TARGET.address), TARGET)
+        objects['/phone']['org.bluez.Device1']['Paired'] = False
+        del objects['/second']
+        with self.assertRaises(SensorError):
+            select_paired_phone(objects)
+
+    def test_connect_requires_encryption_and_closes_on_security_failure(self):
+        sensor = ConnectionSensor(lambda: TARGET)
+        sensor.target = TARGET
+        link = Mock()
+        with patch('dynamic_lock_bluetooth.socket.socket', return_value=link):
+            sensor._connect()
+        link.setsockopt.assert_called_once_with(274, 4, b'\x02\x00')
+        sensor.close()
+        link.setsockopt.side_effect = PermissionError()
+        with patch('dynamic_lock_bluetooth.socket.socket', return_value=link), self.assertRaises(PermissionError):
+            sensor._connect()
+        self.assertEqual(link.close.call_count, 2)
+
+    def test_controller_link_must_be_authenticated_and_encrypted(self):
+        sensor = ConnectionSensor(lambda: TARGET)
+        sensor.target = TARGET
+        peer = bytes.fromhex(TARGET.address.replace(':', ''))[::-1]
+        for mode in (0, 2, 4, 6):
+            def reply(_fd, _request, buffer, _mutate):
+                buffer[8:] = struct.pack('=H6sBBHI', 7, peer, 1, 1, 1, mode)
+            with patch('dynamic_lock_bluetooth.fcntl.ioctl', side_effect=reply):
+                if mode == 6:
+                    self.assertEqual(sensor._handle(Mock()), 7)
+                else:
+                    with self.assertRaises(SensorError):
+                        sensor._handle(Mock())
+
+    def test_unsupported_sockets_and_security_are_actionable(self):
+        from types import SimpleNamespace
+        sensor = ConnectionSensor(lambda: TARGET)
+        with patch('dynamic_lock_bluetooth.socket', SimpleNamespace()):
+            self.assertIn('unsupported', sensor.sample().reason)
+        sensor._connect = Mock(side_effect=OSError(errno.EPROTONOSUPPORT, 'private'))
+        result = sensor.sample()
+        self.assertEqual(result.kind, 'unknown')
+        self.assertIn('unsupported', result.reason)
+        self.assertNotIn('private', result.reason)
