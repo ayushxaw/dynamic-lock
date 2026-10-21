@@ -47,6 +47,7 @@ DeprecationWarnings in the GLib integration test; the test still passes.
 | 20-second process scheduling stop | Status correctly became stale; old readings were invalidated; fresh readings re-armed without a lock decision. | Actual delayed-process recovery; not physical suspend. |
 | Actual laptop Bluetooth off/on | Locking inhibited while the local adapter was off; encrypted measurements and fresh arming recovered after power returned; zero lock decisions. | Actual local controller interruption, avoiding other connected devices. |
 | Pause across another 20-second scheduling stop | Remained PAUSED; resume required fresh arming; zero lock decisions. | Idempotent controls and pause preservation across a scheduling gap. |
+| Final readiness recheck | Doctor reported remote connection timeout with a responding local controller. A subsequent 96.3-second dry-run received 13 absence observations, no measurements and zero lock decisions; it stayed unarmed. BlueZ still reported the configured phone paired/bonded and the adapter powered. | The phone was not reachable at handoff. Its physical location, radio toggle and screen state were not independently known, so this is not a verified physical departure test or current readiness pass. |
 
 The 30-minute run used presence engine commit `c1353f8`. Subsequent changes tighten
 GNOME Lock acknowledgement/custom-helper handling and reject a locally blocked
@@ -104,5 +105,8 @@ UNKNOWN-only run when the pairing was missing. It was not a proximity success.
 The optional [GSConnect guide](docs/GSCONNECT.md) describes the separate fallback;
 its earlier historical lock result does not certify Bluetooth range behavior.
 
-AI assisted research, implementation, tests and documentation. No private device
-IDs, addresses, tokens or machine-specific private configuration are published.
+AI assisted research, implementation, tests and documentation. The current tracked
+files were checked against the private configured identities and contain none of
+them; no GitHub-token-shaped credentials were found in the inspected patch history.
+This current-file check does not certify that older Git history contains no
+identifiers. Private configuration remains outside the repository.
