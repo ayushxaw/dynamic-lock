@@ -59,7 +59,7 @@ class Desktop:
                 completed = True
                 callback(success)
 
-        def verify(fallback=None):
+        def verify():
             deadline = time.monotonic() + 3
 
             def check():
@@ -70,10 +70,7 @@ class Desktop:
                     if active is True:
                         finish(True)
                     elif time.monotonic() >= deadline or not guard():
-                        if fallback and guard():
-                            fallback()
-                        else:
-                            finish(False)
+                        finish(False)
                     else:
                         GLib.timeout_add(200, check)
                 self.active(result)
@@ -84,7 +81,10 @@ class Desktop:
             if not guard() or lock_settings_problem():
                 finish(False)
                 return
-            self.call(SAVER, SAVER_PATH, SAVER, 'Lock', lambda _: verify())
+            # GetActive alone can mean idle blanking. Require the explicit Lock
+            # method to succeed before accepting its subsequent active state.
+            self.call(SAVER, SAVER_PATH, SAVER, 'Lock',
+                      lambda value: finish(False) if value is None else verify())
 
         if not guard() or lock_settings_problem():
             finish(False)
@@ -102,19 +102,20 @@ class Desktop:
                 timed_out = True
                 process.force_exit()
                 return GLib.SOURCE_REMOVE
-            timer = GLib.timeout_add_seconds(3, timeout)
+            # Keep enough of the monitor's three-second evidence freshness
+            # budget for the GNOME request, even if the helper hangs.
+            timer = GLib.timeout_add(1000, timeout)
 
             def exited(child, result):
                 if not timed_out:
                     GLib.source_remove(timer)
                 try:
-                    success = child.wait_check_finish(result)
+                    child.wait_check_finish(result)
                 except GLib.Error:
-                    success = False
-                if success:
-                    verify(gnome)
-                else:
-                    gnome()
+                    pass
+                # A custom command's exit status/blank screen is not proof of
+                # credential locking. GNOME Lock is always requested as well.
+                gnome()
             process.wait_check_async(None, exited)
         else:
             gnome()
