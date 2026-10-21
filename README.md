@@ -70,6 +70,13 @@ While changes are under review, use the branch attached to [PR #1](https://githu
 
 A daemon, probe, doctor, and dry-run share a single-instance lock. Use `--disable` before a foreground diagnostic; stop that diagnostic with Ctrl+C before enabling the service. `--enable` checks immediate readiness; it cannot certify that you performed the physical acceptance tests.
 
+Pairing alone does not run the monitor. `--doctor` performs one check and closes
+its own Bluetooth channel on exit; `--probe` also stops after its duration.
+Only a running daemon or dry-run keeps the measurement channel open and retries
+outbound connections. Keep `--dry-run` running during a reconnection test and
+check `--status` for **Diagnostic: active**. Automatic locking stays disabled in
+that mode.
+
 ## Decisions and recovery
 
 | Input or condition | Behavior |
@@ -129,9 +136,18 @@ Config is data, never sourced or evaluated. Invalid values and duplicate setting
 
 Commands are installed at `~/.local/bin/dynamic_lock.sh`. Pause lasts until resume or process restart; `--disable` persists across login. Configuration and pause are not auto-modified by a phone return.
 
+For Bluetooth, status also reports `sdp_connection_attempts` and
+`last_connection_attempt_age_seconds`. These count outbound SDP socket connection
+calls, including opening a channel over an already existing Bluetooth link. They
+are not counts of radio packets or proof that a fresh underlying link succeeded.
+While a valid channel remains open, it is reused and the attempt count stays
+constant. A powered-off or unreachable phone receives repeated attempts only
+while the monitor is running and unpaused.
+
 ## Troubleshooting
 
 - **Phone not found/unpaired:** use Ubuntu Bluetooth settings to check the existing pairing and the address in your private config. A powered local adapter does not establish that the configured phone is paired. Do not select a different device just to clear the diagnostic.
+- **Phone reconnects only after tapping Connect:** first check that a daemon or dry-run is actually running. A completed doctor/probe cannot continue reconnecting. Watch the SDP attempt count while a continuous dry-run runs, and test a full phone Bluetooth off/on cycle without manually connecting. Successful channel opens on an existing link do not prove automatic reconnection after complete link loss. If attempts continue but the nearby paired phone only answers after a manual connection, this phone's app-free background reconnection remains unsupported until a device-specific cause is established. The monitor does not imitate earbuds by opening audio/call profiles. BlueZ's general `Connect()` can activate multiple profiles, so it is not used as an indiscriminate retry helper. [BlueZ Device API](https://github.com/bluez/bluez/blob/master/doc/org.bluez.Device.rst)
 - **SDP refused, malformed replies, or unavailable connection RSSI:** bring the phone nearby, check pairing, and retry `--doctor`. If these persist with the screen off, this phone/controller is unsupported by this app-free sensor. Do not run the monitor as root to bypass it.
 - **Always `0`, even in another room:** `0` is valid and may cover a wide signal range. Test farther away. This setup cannot guarantee a room boundary or metre distance; confirmed connection loss is the other supported departure signal.
 - **Phone Bluetooth off does not lock:** first confirm the monitor had reached `NEAR_ARMED`. Inspect the reason shown in dry-run/status. Refusal or an unavailable measurement deliberately inhibits locking; only repeated remote timeouts with a healthy local controller establish absence. Record the actual behavior before enabling.

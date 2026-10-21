@@ -6,7 +6,7 @@ measures connection loss, not physical distance.
 
 ## Automated checks actually run
 
-`/usr/bin/python3 -B -m unittest discover -s tests -q`: **85 tests passed**.
+`/usr/bin/python3 -B -m unittest discover -s tests -q`: **92 tests passed**.
 The tests cover:
 
 - SDP lengths, transaction IDs, record/continuation bounds; HCI event length,
@@ -20,6 +20,11 @@ The tests cover:
   one lock per departure, bounded lock retry, pause and suspend invalidation.
 - One outstanding worker job, generation changes, stale/delayed results, and
   readings interrupted by a simulated suspend.
+- Outbound SDP retry after consecutive timeouts without any phone-side event,
+  automatic channel replacement after remote closure or measurement failure,
+  redacted connection-attempt count/age, and live diagnostic versus stopped-monitor
+  status, including a new diagnostic holding the lock over an earlier run's state.
+  Socket/controller boundaries are mocked for these regression tests.
 - GNOME idle units, explicit Lock acknowledgement plus active-state verification,
   failure when a screen is already blank but Lock fails, and bounded custom
   helpers. A real GLib/subprocess test kills a hanging helper within the evidence
@@ -69,6 +74,40 @@ and one confirmed lock. No unlock was attempted. The phone did not physically
 depart for this test, and actual password entry was not independently verified.
 
 ## Hardware acceptance checklist
+
+### Reconnection investigation after the final recheck
+
+The phone subsequently became reachable again, following a user report that they
+had to connect from its Bluetooth settings. Inspection confirmed that the current
+underlying ACL link was phone-initiated. No daemon or diagnostic was running after
+the previous checks ended, so no continuing background reconnects were being made.
+A continuous no-lock diagnostic was started and reached `NEAR_ARMED`.
+Its subsequent 462.8-second run obtained 83 encrypted readings, no unknown/absence
+observations and zero lock decisions. This run used the earlier runtime while
+the reconnection diagnostics were being developed; it did not verify phone screen
+state or a fresh underlying-link reconnection.
+
+Three separate automatic opens of the program's own encrypted SDP channel returned
+valid RSSI `0` (0.922, 0.408 and 0.482 seconds). However, BlueZ stayed connected
+between these channel opens. They prove channel re-establishment on this existing
+link, **not** creation of a fresh laptop-initiated ACL link after full loss. The
+program did not connect audio/network profiles or globally disconnect the phone.
+A fresh local power-cycle test was skipped because an unrelated Bluetooth mouse
+was connected. A BlueZ restart attempt was denied without interactive authorization;
+no restart occurred. Physical phone off/on and automatic cold reconnection are
+still required.
+
+The new status counters distinguish actual outbound SDP connection calls from a
+stopped monitor. They cannot prove that a phone accepts those calls in the
+background. The later reconnection investigation supersedes the earlier
+unreachable-at-handoff observation as a description of current reachability, while
+both observations remain part of this record.
+
+Runtime commit `ef00885` was then installed, with private configuration unchanged
+and installed modules checked against source. A new bounded one-hour no-lock
+diagnostic was started. Its status uses the current lock owner's PID, avoiding
+stale readiness from another process. This diagnostic is separate from the
+disabled automatic-lock service and does not enable login startup.
 
 These physical checks remain unproven unless explicitly recorded below. Automated
 simulation and successful nearby readings do not replace them.
