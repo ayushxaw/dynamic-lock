@@ -2,9 +2,9 @@
 
 Lock your laptop after your paired phone moves out of Bluetooth range or its connection signal stays weak. A confirmed nearby return re-arms monitoring. **It never unlocks your session. Wi-Fi is irrelevant.**
 
-This is an app-free, experimental implementation of Windows-style Dynamic Lock for Ubuntu GNOME. It uses a live Bluetooth Classic connection, GNOME's idle monitor, and a systemd **user** service. No KDE Connect, GSConnect, phone app, root service, or continuous Bluetooth discovery scan is required.
+This is an app-free Bluetooth prototype of Windows-style Dynamic Lock for Ubuntu GNOME. It uses a live Bluetooth Classic connection, GNOME's idle monitor, and a systemd **user** service. No phone app, root service, or continuous Bluetooth discovery scan is required. The optional [GSConnect backend](docs/GSCONNECT.md) is available as a network-disconnect fallback; Bluetooth is the default.
 
-**Current status:** implemented and covered by automated tests; full hardware acceptance is pending. A successful connection/RSSI diagnostic does not establish reliable background operation or walk-away locking. See [verification results and remaining checks](VERIFICATION.md). Installation leaves automatic locking **disabled**, including upgrades.
+**Current status:** a tested prototype, with automated and live results in the verification record. Actual walk-away distance, phone-off behavior, and screen-off stability must be distinguished from simulated tests and individual RSSI readings. See [verification results and remaining checks](VERIFICATION.md). Installation leaves automatic locking **disabled**, including upgrades.
 
 ## What “range” means
 
@@ -12,14 +12,14 @@ Microsoft describes Dynamic Lock as Bluetooth signal-based locking gated by inac
 
 Classic **connection RSSI** is relative to the receiver's preferred signal range. `0` is a valid reading inside that range, negative means below it, and positive means above it. It is **not discovery RSSI in dBm** and is not a distance in metres. Walls, pockets, antennas, and controller power management affect results. Being in another room may still be within range. [Bluetooth Core specification, §7.5.4](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html)
 
-GSConnect/KDE Connect network reachability cannot establish that you have left your desk while both devices remain on the same home Wi-Fi. That integration is no longer used for proximity decisions.
+GSConnect/KDE Connect network reachability cannot establish that you have left your desk while both devices remain on the same home Wi-Fi. The default Bluetooth backend does not use that integration for proximity decisions.
 
 ## Requirements and support scope
 
 - Ubuntu GNOME on Wayland with a running graphical session, systemd user manager, and BlueZ.
 - System `/usr/bin/python3`, PyGObject (`python3-gi`, `gir1.2-glib-2.0`), and Linux Bluetooth socket support.
 - A phone paired through **Ubuntu Settings → Bluetooth**.
-- A phone that accepts Bluetooth Classic SDP queries while its screen is off, and a controller/kernel exposing readable connection RSSI without extra privileges.
+- A paired phone that accepts encrypted Bluetooth Classic SDP queries while its screen is off, and a controller/kernel exposing readable connection RSSI without extra privileges.
 - GNOME screen locking enabled; the session must support Mutter `GetIdletime` and `org.gnome.ScreenSaver`.
 
 The inspected system is Ubuntu 26.04.1, BlueZ 5.85, Python 3.14.4, GNOME Wayland. Android and iPhone are intended targets, **not verified compatibility claims**. Other desktops, architectures, distributions, and phone models have not completed acceptance testing. BLE-only devices do not support this sensor.
@@ -43,7 +43,7 @@ cd dynamic-lock
 While changes are under review, use the branch attached to [PR #1](https://github.com/theayushlab/dynamic-lock/pull/1) to try this implementation.
 
 1. Pair the phone in **Ubuntu Settings → Bluetooth**. Find its address locally with `bluetoothctl devices Paired`.
-2. Edit `~/.config/dynamic_lock/config` and set `PHONE_ADDRESS`. Keep this file private; do not paste its contents into issues or commit it.
+2. Run `~/.local/bin/dynamic_lock.sh --setup`. It selects one paired phone and saves its address only in `~/.config/dynamic_lock/config`. If several phones are paired, set `PHONE_ADDRESS` privately to choose one first. Do not publish that file.
 3. Run a no-lock prerequisite check:
 
    ```bash
@@ -80,7 +80,7 @@ A daemon, probe, doctor, and dry-run share a single-instance lock. Use `--disabl
 | Value between thresholds or a near reading | Cancel pending departure immediately; confirm a stable near return before re-arming after a lock. |
 | No samples, unavailable RSSI, protocol error, permission failure, refused service, missing pairing, or local Bluetooth fault | `UNKNOWN`; clear departure evidence and require fresh nearby arming. Retry with delays capped at 30 seconds. |
 | Confirmed departure | Recheck fresh sensor evidence, GNOME lock settings, and idleness before requesting a lock. |
-| Lock request | Require GNOME `GetActive=true`; retry failures with backoff capped at five minutes, only while departure remains confirmed. |
+| Lock request | Require an acknowledged GNOME `Lock` request and `GetActive=true`; retry failures with backoff capped at five minutes, only while departure remains confirmed. |
 | Confirmed return | Re-arm after five seconds of near evidence; never unlock. |
 | Suspend/resume or a long scheduling gap | Discard old readings and delayed worker results; close only our sockets; require fresh arming. User pause survives suspend. |
 
@@ -91,6 +91,7 @@ At defaults, measurements start about every five seconds; one bounded worker per
 The installer preserves existing configuration contents and sets the directory/file permissions to `700`/`600`. Missing settings use these defaults:
 
 ```ini
+BACKEND=bluetooth
 PHONE_ADDRESS=
 RSSI_NEAR_THRESHOLD=-5
 RSSI_AWAY_THRESHOLD=-10
@@ -106,7 +107,7 @@ IDLE_AFTER_SECONDS=1
 - `RSSI_STALE_SECONDS` (10–60) expires evidence to **unknown**, never to departure. It must be at least twice `POLL_SECONDS` (2–10).
 - `AWAY_CONFIRM_SECONDS` (10–300) and `RETURN_CONFIRM_SECONDS` (1–60) require continuous qualifying observations. Faults and the threshold gap cancel timers.
 - `IDLE_AFTER_SECONDS` (0–3600) uses GNOME idle time. The default is one second; `0` still requires the idle API to respond.
-- `LOCK_CMD`, if set, is parsed into an executable and arguments without a shell. It has a three-second execution timeout, must produce a GNOME-confirmed lock, and falls back to the GNOME lock method if it fails while sensor evidence remains fresh. Prefer the built-in GNOME method.
+- `LOCK_CMD`, if set, is parsed into an executable and arguments without a shell. It has a one-second execution budget so sensor evidence stays fresh. GNOME’s explicit `Lock` method is always requested afterward, and its result and active state must both confirm success. Prefer the built-in GNOME method.
 - `RSSI_DROP_DB` and older GSConnect settings are reported as obsolete and ignored; their units/values are **not converted**. Remove them yourself after reviewing the new defaults.
 
 Config is data, never sourced or evaluated. Invalid values and duplicate settings fail with a diagnostic rather than silently activating different behavior. Restart an already enabled service after editing valid settings; restart clears all arming evidence.
@@ -115,8 +116,9 @@ Config is data, never sourced or evaluated. Invalid values and duplicate setting
 
 | Command | Purpose |
 |---|---|
+| `--setup` | Select a paired phone for the configured backend and save its identity privately; no locking. |
 | `--doctor` | One connection reading, local controller health, GNOME API/settings checks; never locks. |
-| `--probe` | 30-second dry-run of the full production decision loop. |
+| `--probe` | 30-second measurement/arming dry-run; use `--dry-run` for a full departure cycle. |
 | `--dry-run [--duration SECONDS]` | Full monitor with no lock actuator; omit duration to run until Ctrl+C. |
 | `--enable` | Check readiness, enable login startup, and start automatic monitoring. |
 | `--disable` | Stop the automatic service and disable login startup. |
@@ -148,7 +150,7 @@ journalctl --user -u dynamic_lock.service -b
 
 Identifiers stay in the private config and in-memory BlueZ/socket calls. Runtime status and diagnostics omit phone names, addresses, service records, and raw D-Bus error strings. There is no telemetry. Never publish raw `bluetoothctl` output or your configuration.
 
-The sensor opens its own SDP channel and sends a small validated request. It does not start discovery, connect audio/network profiles, reset the controller, or disconnect other applications' connections. Paired-device selection is not a claim of cryptographic presence authentication or relay resistance. Keep normal GNOME idle locking and use **Super+L** when you need an immediate lock.
+The sensor opens its own SDP channel and sends a small validated request. It does not start discovery, connect audio/network profiles, reset the controller, or disconnect other applications' connections. The SDP socket requires encryption, and each reading verifies the connection handle, paired peer and authenticated/encrypted controller flags. This does not establish physical presence or relay resistance. Keep normal GNOME idle locking and use **Super+L** when you need an immediate lock.
 
 The user service retains read-only home/system access, a private runtime directory, `NoNewPrivileges`, a private temporary directory, and memory/CPU limits. Unix and Bluetooth sockets remain allowed for desktop integration and the sensor. No system-wide service or new capabilities are installed.
 
@@ -169,11 +171,12 @@ systemd-analyze --user verify dynamic_lock.service
 git diff --check
 ```
 
-- `dynamic_lock_bluetooth.py`: SDP/HCI protocol validation and fault classification.
+- `dynamic_lock_bluetooth.py`: encrypted SDP/HCI protocol validation, paired-phone setup selection, and fault classification.
 - `dynamic_lock_state.py`: deterministic, bounded proximity state machine.
 - `dynamic_lock_monitor.py`: one radio worker, recovery, status, signals, dry-run/doctor.
 - `dynamic_lock_desktop.py`: asynchronous GNOME idle/lock calls and lock confirmation.
-- `dynamic_lock_config.py`: strict, non-executing private config reader.
+- `dynamic_lock_config.py`: strict, non-executing private config reader and private setup writes.
+- `dynamic_lock_gsconnect.py`: optional GSConnect connection fallback; unused by the default Bluetooth backend.
 
 AI assisted the research, implementation, tests, and documentation. Review the small commits in PR #1 and use the no-lock diagnostics to verify the behavior yourself. Automated tests simulate failure paths; they cannot replace phone and desktop acceptance tests. See [VERIFICATION.md](VERIFICATION.md) for evidence and limitations.
 

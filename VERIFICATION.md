@@ -1,63 +1,108 @@
-# Verification record
+# Verification record — 2026-10-21
 
-This file separates implemented behavior, automated evidence, and hardware evidence. No private device identifiers are recorded.
+Bluetooth is the primary prototype. It measures an encrypted Classic connection;
+Wi-Fi/GSConnect is not used by that backend. The optional GSConnect fallback
+measures connection loss, not physical distance.
 
-## Implemented
+## Automated checks actually run
 
-Live Classic SDP connection plus native Linux HCI RSSI; explicit thresholds; bounded and fresh evidence; UNKNOWN fault handling; remote timeout classification with local controller checks; idle-gated GNOME lock confirmation; bounded retries; one radio worker; pause/resume and suspend invalidation; private config; staged installation; doctor and full dry-run; hardened user service.
+`/usr/bin/python3 -B -m unittest discover -s tests -q`: **85 tests passed**.
+The tests cover:
 
-## Automated evidence — 2026-10-17
+- SDP lengths, transaction IDs, record/continuation bounds; HCI event length,
+  status/opcode/peer/handle checks; unavailable RSSI and valid zero; authenticated
+  and encrypted link flags; connection cleanup and unsupported/permission errors.
+- Remote page timeout (`EHOSTDOWN`) versus refusal, local failure and missing or
+  locally blocked pairing. Local controller health is required for timeout-based
+  absence evidence.
+- Fresh arming, stale data, hour-separated readings, fixed thresholds without a
+  drifting baseline, threshold jitter, interrupted returns, startup while away,
+  one lock per departure, bounded lock retry, pause and suspend invalidation.
+- One outstanding worker job, generation changes, stale/delayed results, and
+  readings interrupted by a simulated suspend.
+- GNOME idle units, explicit Lock acknowledgement plus active-state verification,
+  failure when a screen is already blank but Lock fails, and bounded custom
+  helpers. A real GLib/subprocess test kills a hanging helper within the evidence
+  freshness budget, then follows the GNOME path using a mocked desktop endpoint.
+- Private phone setup, config parsing/permissions/preservation, and installation,
+  upgrade, activation/controls/status/logs/uninstall in isolated temporary homes.
+- Distinct GSConnect connection observations, local NetworkManager health and
+  service ownership, phone identity selection, and simulated disconnect/return
+  cycles. These do not certify GSConnect phone background compatibility.
 
-`/usr/bin/python3 -B -m unittest discover -s tests -q` passes **57 tests**. Coverage includes:
+Shell syntax checks and `git diff --check` pass. `systemd-analyze --user verify dynamic_lock.service` exits successfully; the host reports an unrelated warning
+in its installed `spice-vdagent.service`. PyGObject emits Python 3.14 asyncio
+DeprecationWarnings in the GLib integration test; the test still passes.
 
-- SDP lengths, transaction IDs, response types, handle counts, continuation bounds, socket cleanup.
-- HCI event lengths, status, opcode, connection identity/handles, deadline, delayed/wrong-handle responses, zero RSSI and unavailable RSSI.
-- Remote timeout versus local fault, including Linux HCI page timeout (`EHOSTDOWN`), service refusal, malformed replies, adapter replacement.
-- Stale samples, hour-separated arming regression, fixed thresholds after a stronger nearby signal, jitter, interrupted return, startup while absent, one lock per departure, retry backoff.
-- Pausing, repeated resume, pause across suspend, worker generation changes, delayed results, one outstanding job, discarded sleep-interrupted measurements.
-- GNOME idle milliseconds, missing/active idle gate, disabled locks, lock confirmation, bounded custom command, dry-run never invoking the actuator.
-- Three **simulated** departure/return cycles through the production monitor loop, including weak signal and remote absence, with decisions within 60 simulated seconds and fresh arming after a local fault.
-- Private config parsing/permissions and obsolete settings; install, upgrade, config preservation, activation refusal, controls, status freshness, logs, uninstall and running-process protection in an **isolated temporary home** with fake systemctl/journalctl.
-- Service configuration preserves the instance-lock inode across service stops/failures and permits the Unix/Bluetooth sockets needed for desktop integration.
+## Live Bluetooth evidence
 
-`bash -n dynamic_lock.sh install.sh uninstall.sh` passes.
-`systemd-analyze --user verify dynamic_lock.service` exits successfully; this host reports an unrelated warning in its installed `spice-vdagent.service`.
+| Check | Observed result | Scope |
+|---|---|---|
+| Paired-phone setup | Saved the selected paired phone address in the private config; no identifier printed or committed. | Correct target selection on this laptop. |
+| Six live samples | Six validated connection RSSI readings of `0`, without administrator privileges. | Establishes live measurement availability. |
+| Link security | Controller flags showed authentication and encryption. Enforcing socket security and checking both flags still produced valid RSSI `0`. | Bonded encrypted link works on this configuration. |
+| Installed doctor | GNOME idle/lock-state APIs and local HCI health read succeeded; encrypted RSSI available. | Current prerequisites work; doctor sends no lock. |
+| Hardened 30-minute no-lock run | **1,800.6 seconds; 324 measured samples; RSSI −1 to +1; zero UNKNOWN samples; zero lock decisions.** | Sustained live measurement/state stability. Phone screen/settings state and physical location were not independently confirmed. |
+| Resources during that run | Journal: **3.201 seconds CPU over 30 minutes 1.418 seconds wall time; 22.9M peak memory.** | Healthy-link workload on this laptop; no battery-life claim. |
+| 20-second process scheduling stop | Status correctly became stale; old readings were invalidated; fresh readings re-armed without a lock decision. | Actual delayed-process recovery; not physical suspend. |
+| Actual laptop Bluetooth off/on | Locking inhibited while the local adapter was off; encrypted measurements and fresh arming recovered after power returned; zero lock decisions. | Actual local controller interruption, avoiding other connected devices. |
+| Pause across another 20-second scheduling stop | Remained PAUSED; resume required fresh arming; zero lock decisions. | Idempotent controls and pause preservation across a scheduling gap. |
 
-These tests do not establish physical range, phone background compatibility, actual password requirements, real suspend behavior, battery impact, or resistance to radio interference.
+The 30-minute run used presence engine commit `c1353f8`. Subsequent changes tighten
+GNOME Lock acknowledgement/custom-helper handling and reject a locally blocked
+phone. Those changes are covered separately; the no-lock run did not exercise a
+lock actuator. It is not presented as an actual walk-away test or a confirmed
+screen-off compatibility pass.
 
-## Hardware/runtime observations
+The real recovery checks also used a hardened user service, had no automatic
+unlock path, and recorded zero real locks. Private config contents were preserved
+through reinstallation, and installed modules were compared with source files.
 
-| Observation | Evidence and limit |
-|---|---|
-| Initial feasibility, 2026-10-15 | Six validated SDP queries and six connection RSSI readings of `0` without administrator privileges during the audit. Establishes an available measurement path only. |
-| New implementation doctor, 2026-10-15 | One validated live connection RSSI reading of `0`; GNOME idle and lock-state APIs available. No lock was sent. |
-| Current pairing checks, 2026-10-16 and 2026-10-17 | Local BlueZ adapter powered, but the configured phone is no longer among its known devices. The program reports an actionable error and does not silently select another phone. |
-| 30-second full dry-run, 2026-10-16 | Three UNKNOWN observations, zero lock decisions, zero real locks; exited with nonzero diagnostic result because no measured samples were obtained. This is **not** a nearby stability pass. |
-| Hardened transient user-service check, 2026-10-16 | The no-lock fault-recovery run completed: 1,799.8 seconds in the monitor, 60 UNKNOWN observations, zero measured samples, zero lock decisions, zero real locks. Its diagnostic exit status was 1 because it obtained no measurements. This is **not** a nearby stability or range pass. |
-| Fault-recovery resource use | The journal reports 2.520 seconds CPU over 30 minutes 4.236 seconds wall time, and 20.8M memory peak. This measures the missing-pairing workload only; healthy-link resource use and battery impact remain untested. |
-| Local controller health under hardening, 2026-10-16 | An unprivileged HCI Read Local Version command succeeded with Unix/Bluetooth socket restrictions, read-only home/system, NoNewPrivileges, and private temporary storage. No phone connection or lock was requested. |
-| Pause/resume signals, 2026-10-16 | Repeated SIGUSR1/SIGUSR2 on the running dry-run changed status to PAUSED and back to UNKNOWN recovery without duplicate monitoring. Real suspend remains pending. |
-| Final installation, 2026-10-17 | Installed modules, CLI and user unit matched the worktree; existing private config contents were compared byte-for-byte and preserved. Automatic service stayed inactive/disabled. |
-| Live instance-lock lifecycle, 2026-10-17 | A foreground dry-run held the lock while a second service with the final hardening attempted startup. The service and a subsequent doctor were refused; the lock inode remained the same and the first dry-run completed its 12-second run without real locking. |
+## Controlled GNOME lock check
 
-The installed automatic service remains **disabled and inactive**. The 30-minute temporary diagnostic has finished; it did not enable login startup. GitHub Actions also passed the preceding 56-test revision; subsequent commits rerun the checks on the PR.
+A separate controlled production-monitor check **passed** in 51.9 seconds:
+three real encrypted nearby readings armed it, followed by seven explicitly
+**simulated** absence observations. The actual GNOME Lock call was acknowledged,
+GetActive confirmed the lock, and the monitor recorded exactly one lock decision
+and one confirmed lock. No unlock was attempted. The phone did not physically
+depart for this test, and actual password entry was not independently verified.
 
 ## Hardware acceptance checklist
 
-Run these on each intended phone/controller combination. They are **pending** until recorded with actual observations. A pairing that disappears or UNKNOWN-only run cannot satisfy them.
+These physical checks remain unproven unless explicitly recorded below. Automated
+simulation and successful nearby readings do not replace them.
 
-1. Restore/check the configured pairing locally. `--doctor` must obtain a valid connection measurement and local controller health response, and reach both GNOME APIs.
-2. Keep the phone beside the laptop, close Bluetooth settings, turn its screen off. Run `--dry-run --duration 1800`. Require 30 minutes of useful measurements, stable arming, and no false departure decision. Record UNKNOWN/reconnect events separately.
-3. Keep both devices on the **same Wi-Fi** and run three actual departure/return cycles. Wait for `NEAR_ARMED`, move beyond the useful Bluetooth range, and leave the laptop idle. Require a dry-run decision within 60 seconds of sustained weak signal or confirmed connection loss. Bring the phone back and confirm fresh re-arming each time. Record times from observed signal/loss, not estimated metres.
-4. After arming, turn phone Bluetooth off. Require repeated remote timeouts with a responsive local controller, followed by a decision; record refusal/UNKNOWN as an unsuccessful compatibility test, not a pass.
-5. Turn laptop Bluetooth off/on, restart BlueZ, suspend/resume, and try brief interference. Local failures must inhibit locking; restoration must re-arm from fresh near readings. Pause before one suspend and confirm pause survives. Coordinate these disruptive actions with the person using the laptop.
-6. Only after these checks, `--enable`. Perform a real departure, confirm GNOME lock state **and that a password is actually required**. Confirm phone return never unlocks, and a second departure can lock again after manual unlock.
-7. Measure memory/CPU during both a healthy connection and fault recovery. Report elapsed time and workload. Battery impact requires a separate controlled test.
+1. Confirm a 30-minute nearby run with phone Bluetooth settings closed and screen
+   off, with stable arming and no false departure. The observed run above did not
+   independently establish those physical conditions.
+2. Perform three real departure/return cycles while both devices remain on the
+   same Wi-Fi. Require a lock decision within 60 seconds of sustained weak signal
+   or confirmed remote connection loss, then reliable fresh re-arming.
+3. Turn the phone's Bluetooth off after arming. Require repeated remote timeouts
+   with a healthy local controller followed by a decision; distinguish refusal,
+   authentication faults and unavailable measurements from departure.
+4. Test a real BlueZ restart and real suspend/resume, including pause across
+   suspend, and brief interference. The actual adapter power-cycle/scheduler tests
+   above cover related paths but do not establish all of these cases.
+5. Verify an actual credential prompt/password requirement and that phone return
+   never unlocks. GNOME Lock acknowledgement/GetActive is software evidence;
+   password entry remains a distinct human observation.
 
-## Known limits and next actions
+The installed automatic service remains inactive and disabled, as required by
+the approved activation gate while the physical acceptance checks remain pending. A finished prototype, successful automated tests, and live measurement
+stability are not a universal phone/range guarantee.
 
-- The configured pairing currently needs attention before background/range acceptance can proceed.
-- The program's six-second connection deadline is chosen to exceed the usual Classic page timeout; actual remote-off behavior still depends on the phone and controller.
-- Classic RSSI zero spans a hardware-dependent preferred range. A room boundary may not produce weak RSSI; test actual separation before tuning.
-- GNOME `GetActive` confirmation is implemented, but physical password verification remains a human acceptance step.
-- Android/iPhone background support, real fault recovery, three physical cycles, and battery life remain unverified. A companion app is a future fallback if the app-free sensor fails these checks.
+## Support and history
+
+Target inspected: Ubuntu 26.04.1 GNOME Wayland, system Python 3.14.4, BlueZ 5.85.
+Other phone/controller combinations and Android/iPhone background behavior require
+field testing. Severe radio interference and genuine range loss cannot always be
+distinguished; detected local faults inhibit locking and brief drops receive grace.
+
+The [October 17 Bluetooth record](docs/BLUETOOTH_VERIFICATION.md) documents an older
+UNKNOWN-only run when the pairing was missing. It was not a proximity success.
+The optional [GSConnect guide](docs/GSCONNECT.md) describes the separate fallback;
+its earlier historical lock result does not certify Bluetooth range behavior.
+
+AI assisted research, implementation, tests and documentation. No private device
+IDs, addresses, tokens or machine-specific private configuration are published.
