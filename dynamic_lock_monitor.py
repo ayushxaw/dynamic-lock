@@ -194,7 +194,8 @@ class Monitor:
             relevant = ((path == target.adapter_path and interface == ADAPTER and
                          ('Powered' in changed or 'Powered' in invalid)) or
                         (path == target.device_path and interface == DEVICE and
-                         ('Paired' in changed or 'Paired' in invalid or 'Adapter' in changed)))
+                         ('Paired' in changed or 'Paired' in invalid or 'Adapter' in changed
+                          or 'Blocked' in changed or 'Blocked' in invalid)))
             if relevant:
                 self.invalidate('Bluetooth adapter or pairing changed; fresh arming required.')
         elif target and name == 'InterfacesRemoved' and values[0] in (target.device_path, target.adapter_path):

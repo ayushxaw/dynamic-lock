@@ -48,6 +48,8 @@ def select_target(objects, address):
     path, device = matches[0]
     if not device.get("Paired", False):
         raise SensorError("Phone is not paired; pair it in Ubuntu Bluetooth settings.")
+    if device.get('Blocked', False):
+        raise SensorError('Configured phone is blocked locally; unblock it in Ubuntu Bluetooth settings. Locking inhibited.')
     adapter_path = device.get("Adapter", "")
     adapter = objects.get(adapter_path, {}).get("org.bluez.Adapter1", {})
     if not adapter.get("Powered", False):

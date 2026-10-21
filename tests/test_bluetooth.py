@@ -156,6 +156,10 @@ class SensorTests(unittest.TestCase):
         objects['/phone']['org.bluez.Device1']['Paired'] = False
         with self.assertRaises(SensorError):
             select_target(objects, TARGET.address)
+        objects['/phone']['org.bluez.Device1']['Paired'] = True
+        objects['/phone']['org.bluez.Device1']['Blocked'] = True
+        with self.assertRaisesRegex(SensorError, 'blocked locally'):
+            select_target(objects, TARGET.address)
 
     def test_adapter_replacement_requires_new_arming_even_without_dbus_signal(self):
         self.sensor.target = TARGET
