@@ -1,0 +1,20 @@
+name: Checks
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+jobs:
+  automated:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system Python bindings
+        run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-glib-2.0
+      - name: Unit and isolated installation tests (no Bluetooth hardware)
+        run: /usr/bin/python3 -B -m unittest discover -s tests -v
+      - name: Shell syntax and whitespace
+        run: |
+          bash -n dynamic_lock.sh install.sh uninstall.sh
+          git diff --check
