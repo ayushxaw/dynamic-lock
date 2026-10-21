@@ -83,15 +83,22 @@ case "$option" in
 import fcntl, json, pathlib, sys, time
 runtime = pathlib.Path(sys.argv[1])
 try:
-    with (runtime / 'monitor.lock').open('a') as lock:
+    with (runtime / 'monitor.lock').open('a+') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             live = False
         except BlockingIOError:
             live = True
+        owner_pid = None
+        if live:
+            lock.seek(0)
+            try:
+                owner_pid = int(lock.read(32))
+            except ValueError:
+                pass
     state = json.loads((runtime / 'state').read_text())
     age = time.time() - state['updated_at']
-    if not live or not 0 <= age <= 15:
+    if not live or owner_pid is None or owner_pid <= 0 or owner_pid != state.get('pid') or not 0 <= age <= 15:
         print('No fresh live monitor status. Historical readings are not readiness evidence.')
         print('No live background reconnects confirmed. Run --dry-run for continuous testing; --doctor exits after one check.')
     else:

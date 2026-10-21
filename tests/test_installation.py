@@ -130,12 +130,28 @@ class InstallationTests(unittest.TestCase):
         self.assertIn('Pairing alone does not start background reconnects', self.run_cmd(str(self.cli), '--status'))
         runtime = self.runtime / 'dynamic-lock'
         runtime.mkdir(mode=0o700, exist_ok=True)
-        (runtime / 'state').write_text(json.dumps({'updated_at': time.time(), 'mode': 'dry-run', 'backend': 'bluetooth', 'state': 'NEAR_ARMED'}))
-        with (runtime / 'monitor.lock').open('a') as handle:
+        (runtime / 'state').write_text(json.dumps({'pid': os.getpid(), 'updated_at': time.time(), 'mode': 'dry-run', 'backend': 'bluetooth', 'state': 'NEAR_ARMED'}))
+        with (runtime / 'monitor.lock').open('w') as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
+            handle.write(str(os.getpid()) + '\n')
+            handle.flush()
             status = self.run_cmd(str(self.cli), '--status')
         self.assertIn('Service: inactive', status)
         self.assertIn('Diagnostic: active;', status)
         self.assertIn('connection monitoring/retries continue with locking disabled', status)
         status = self.run_cmd(str(self.cli), '--status')
         self.assertIn('No live background reconnects confirmed', status)
+
+    def test_new_diagnostic_owner_cannot_make_previous_state_look_live(self):
+        self.run_cmd(str(REPO / 'install.sh'))
+        runtime = self.runtime / 'dynamic-lock'
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        (runtime / 'state').write_text(json.dumps({'pid': os.getpid() + 1, 'updated_at': time.time(), 'mode': 'dry-run', 'backend': 'bluetooth', 'state': 'NEAR_ARMED'}))
+        with (runtime / 'monitor.lock').open('w') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            handle.write(str(os.getpid()) + '\n')
+            handle.flush()
+            status = self.run_cmd(str(self.cli), '--status')
+        self.assertIn('No fresh live monitor status', status)
+        self.assertNotIn('Diagnostic: active', status)
+        self.assertNotIn('NEAR_ARMED', status)

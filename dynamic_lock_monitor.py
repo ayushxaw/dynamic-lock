@@ -475,6 +475,12 @@ def main():
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ConfigError('Another monitor or diagnostic is running. Stop it or use --disable before a new probe.') from None
+            # A doctor/setup can hold the same lock without publishing monitor
+            # state. Identify the owner so status cannot reuse another run's data.
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()) + '\n')
+            lock_file.flush()
             if args.doctor:
                 return doctor(config)
             if args.setup:
