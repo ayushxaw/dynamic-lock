@@ -126,6 +126,20 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(m.machine.state, 'LOCKED_AWAY' if success else 'LOCK_FAILED')
         self.assertEqual(m.counts['confirmed_locks'], 1)
 
+    def test_bluetooth_status_reports_actual_outbound_attempts(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            m = self.monitor
+            m.state_path = Path(temporary) / 'state'
+            m.worker.sensor.connection_status.return_value = {'sdp_connection_attempts': 7, 'last_connection_attempt_age_seconds': 2.5}
+            m._status()
+            status = json.loads(m.state_path.read_text())
+        self.assertEqual(status['sdp_connection_attempts'], 7)
+        self.assertEqual(status['last_connection_attempt_age_seconds'], 2.5)
+        self.assertNotIn(CONFIG['PHONE_ADDRESS'], json.dumps(status))
+
 
 class WorkerTests(unittest.TestCase):
     def setUp(self):

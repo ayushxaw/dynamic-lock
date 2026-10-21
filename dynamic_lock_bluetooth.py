@@ -136,6 +136,14 @@ class ConnectionSensor:
         self.target = None
         self.link = None
         self.transaction = 0
+        self._connection_stats = (0, None)
+
+    def connection_status(self):
+        # One immutable snapshot can be read by the UI while the worker connects.
+        attempts, started_at = self._connection_stats
+        return {'sdp_connection_attempts': attempts,
+                'last_connection_attempt_age_seconds': None if started_at is None else
+                    round(max(0, time.monotonic() - started_at), 1)}
 
     def close(self):
         if self.link is not None:
@@ -151,6 +159,8 @@ class ConnectionSensor:
             link.setsockopt(self.SOL_BLUETOOTH, self.BT_SECURITY,
                             struct.pack('BB', self.BT_SECURITY_MEDIUM, 0))
             link.bind((self.target.local_address, 0))
+            attempts, _ = self._connection_stats
+            self._connection_stats = (attempts + 1, time.monotonic())
             link.connect((self.target.address, 1))  # SDP PSM; no audio/network profile.
         except BaseException:
             link.close()

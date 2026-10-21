@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -123,3 +124,18 @@ class InstallationTests(unittest.TestCase):
         self.run_cmd(str(self.cli), '--enable', 'extra', code=2)
         self.run_cmd(str(self.cli), '--unknown', code=2)
         self.assertIn('2.2.0', self.run_cmd(str(self.cli), '--version'))
+
+    def test_status_distinguishes_live_diagnostic_from_no_monitor(self):
+        self.run_cmd(str(REPO / 'install.sh'))
+        self.assertIn('Pairing alone does not start background reconnects', self.run_cmd(str(self.cli), '--status'))
+        runtime = self.runtime / 'dynamic-lock'
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        (runtime / 'state').write_text(json.dumps({'updated_at': time.time(), 'mode': 'dry-run', 'backend': 'bluetooth', 'state': 'NEAR_ARMED'}))
+        with (runtime / 'monitor.lock').open('a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            status = self.run_cmd(str(self.cli), '--status')
+        self.assertIn('Service: inactive', status)
+        self.assertIn('Diagnostic: active;', status)
+        self.assertIn('connection monitoring/retries continue with locking disabled', status)
+        status = self.run_cmd(str(self.cli), '--status')
+        self.assertIn('No live background reconnects confirmed', status)

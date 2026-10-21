@@ -93,11 +93,18 @@ try:
     age = time.time() - state['updated_at']
     if not live or not 0 <= age <= 15:
         print('No fresh live monitor status. Historical readings are not readiness evidence.')
+        print('No live background reconnects confirmed. Run --dry-run for continuous testing; --doctor exits after one check.')
     else:
-        for key in ('mode', 'backend', 'state', 'sensor', 'signal_units', 'raw_rssi', 'median_rssi', 'reading_age_seconds', 'reason', 'sensor_reason'):
+        if state.get('mode') == 'dry-run':
+            print('Diagnostic: active; connection monitoring/retries continue with locking disabled.')
+        keys = ('mode', 'backend', 'state', 'sensor', 'signal_units', 'raw_rssi', 'median_rssi', 'reading_age_seconds', 'reason', 'sensor_reason')
+        if state.get('backend') == 'bluetooth':
+            keys += ('sdp_connection_attempts', 'last_connection_attempt_age_seconds')
+        for key in keys:
             print(f'{key}: {state.get(key)}')
 except (OSError, ValueError, KeyError):
     print('Monitor state: unavailable; run --doctor or --dry-run.')
+    print('Pairing alone does not start background reconnects. --doctor exits after one check; --dry-run keeps monitoring.')
 PY
         ;;
     --pause|--resume)

@@ -182,10 +182,6 @@ class SensorTests(unittest.TestCase):
             sensor._handle(Mock())
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class BluetoothSetupAndSecurityTests(unittest.TestCase):
     def objects(self):
         return {'/phone': {'org.bluez.Device1': {'Address': TARGET.address, 'Paired': True, 'Icon': 'phone', 'Adapter': TARGET.adapter_path}},
@@ -242,3 +238,80 @@ class BluetoothSetupAndSecurityTests(unittest.TestCase):
         self.assertEqual(result.kind, 'unknown')
         self.assertIn('unsupported', result.reason)
         self.assertNotIn('private', result.reason)
+
+
+class OutboundReconnectTests(unittest.TestCase):
+    @staticmethod
+    def link(connect_error=None):
+        link = Mock()
+        link.connect.side_effect = connect_error
+        requests = []
+
+        def send(packet):
+            requests.append(packet)
+            return len(packet)
+
+        def recv(_maximum):
+            transaction = struct.unpack_from('>H', requests[-1], 1)[0]
+            body = b'\x00\x00\x00\x00\x00'
+            return struct.pack('>BHH', 3, transaction, len(body)) + body
+
+        link.send.side_effect = send
+        link.recv.side_effect = recv
+        return link
+
+    def sensor(self):
+        sensor = ConnectionSensor(lambda: TARGET)
+        sensor._rssi = Mock(return_value=0)
+        sensor._healthy = Mock()
+        self.addCleanup(sensor.close)
+        return sensor
+
+    def test_outbound_retry_after_timeouts_needs_no_phone_event(self):
+        sensor = self.sensor()
+        links = [self.link(TimeoutError()), self.link(OSError(errno.EHOSTDOWN, 'private')), self.link()]
+        with patch('dynamic_lock_bluetooth.socket.socket', side_effect=links) as create:
+            self.assertEqual([sensor.sample().kind for _ in range(3)], ['absent', 'absent', 'measured'])
+            self.assertEqual(sensor.sample().rssi, 0)
+        self.assertEqual(create.call_count, 3)
+        self.assertEqual(sensor.connection_status()['sdp_connection_attempts'], 3)
+        for link in links:
+            link.connect.assert_called_once_with((TARGET.address, 1))
+            link.setsockopt.assert_called_once_with(274, 4, b'\x02\x00')
+        links[0].close.assert_called_once()
+        links[1].close.assert_called_once()
+        links[2].close.assert_not_called()
+
+    def test_closed_channel_opens_a_new_outbound_channel_automatically(self):
+        sensor = self.sensor()
+        old, new = self.link(), self.link()
+        sensor.target, sensor.link = TARGET, old
+        old.recv.side_effect = ConnectionResetError()
+        with patch('dynamic_lock_bluetooth.socket.socket', return_value=new):
+            self.assertEqual(sensor.sample().kind, 'measured')
+        old.close.assert_called_once()
+        new.connect.assert_called_once_with((TARGET.address, 1))
+        self.assertIs(sensor.link, new)
+
+    def test_measurement_fault_does_not_prevent_next_outbound_attempt(self):
+        sensor = self.sensor()
+        old, new = self.link(), self.link()
+        sensor._rssi.side_effect = [SensorError('RSSI unavailable.'), 0]
+        with patch('dynamic_lock_bluetooth.socket.socket', side_effect=[old, new]):
+            self.assertEqual(sensor.sample().kind, 'unknown')
+            self.assertEqual(sensor.sample().kind, 'measured')
+        old.close.assert_called_once()
+        new.connect.assert_called_once_with((TARGET.address, 1))
+
+    def test_connection_attempt_status_reports_age_without_identifiers(self):
+        sensor = self.sensor()
+        self.assertEqual(sensor.connection_status(), {'sdp_connection_attempts': 0, 'last_connection_attempt_age_seconds': None})
+        sensor.target = TARGET
+        with patch('dynamic_lock_bluetooth.socket.socket', return_value=self.link()), patch('dynamic_lock_bluetooth.time.monotonic', return_value=10):
+            sensor._connect()
+        with patch('dynamic_lock_bluetooth.time.monotonic', return_value=14):
+            self.assertEqual(sensor.connection_status(), {'sdp_connection_attempts': 1, 'last_connection_attempt_age_seconds': 4})
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -323,6 +323,8 @@ class Monitor:
                   'reading_age_seconds': None if self.machine.last_sample_at is None else
                       round((milliseconds() - self.machine.last_sample_at) / 1000, 1),
                   'reason': reason, 'sensor_reason': self.sensor_reason, 'counts': self.counts}
+        if self.backend == 'bluetooth':
+            status.update(self.worker.sensor.connection_status())
         try:
             temporary = str(self.state_path) + '.tmp'
             with open(temporary, 'w', encoding='utf-8') as output:
@@ -439,6 +441,8 @@ def doctor(config):
     print('Diagnostic succeeded; background and departure tests are still required.' if ready else
           ('NOT READY: open KDE Connect on the paired phone, connect it to the laptop in GSConnect, then retry.' if backend == 'gsconnect' else
            'NOT READY: bring the paired phone nearby with Bluetooth on, resolve diagnostics, then retry.'))
+    if backend == 'bluetooth':
+        print('This one-shot check closes its own Bluetooth channel on exit. Use --dry-run for continuous connection/reconnection testing.')
     return 0 if ready else 1
 
 
